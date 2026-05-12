@@ -1,18 +1,26 @@
-import { useState, useEffect, useRef, useCallback } from "react";
+/**
+ * AutoAgent Pro — Main Dashboard
+ * AI: Cerebras gpt-oss-120b (primary) + Gemini 2.0 Flash (vision fallback)
+ */
+import { useState, useEffect, useRef } from "react";
 import { useSupabase } from "@/src/contexts/SupabaseContext";
 import { motion, AnimatePresence } from "motion/react";
-import { formatDate } from "@/lib/utils";
+import {
+  Brain, Play, StopCircle, Settings, LayoutDashboard,
+  PlusCircle, Trash2, RefreshCw, ChevronRight, Activity,
+  CheckCircle2, XCircle, Clock, Zap, Globe, Terminal,
+  Eye, EyeOff, AlertTriangle, Info, BarChart3, Key, Layers
+} from "lucide-react";
 
+// ─── Types ────────────────────────────────────────────────────────────────────
 interface Task {
   id: string;
   name: string;
   prompt: string;
-  status: "pending" | "running" | "completed" | "failed" | "scheduled";
-  last_run?: string;
+  status: "idle" | "pending" | "running" | "completed" | "failed";
   schedule?: string;
-  result?: { summary?: string; success?: boolean; stepCount?: number };
-  logs?: string;
-  retry_count?: number;
+  last_run?: string;
+  result?: { success: boolean; summary: string; stepCount: number; completedAt: string };
   created_at: string;
 }
 
@@ -24,676 +32,742 @@ interface TaskLog {
   created_at: string;
 }
 
-type Tab = "dashboard" | "tasks" | "settings" | "history";
+interface SettingsData {
+  cerebras_keys: string[];
+  nopecha_key: string;
+  gemini_key: string;
+}
 
-const STATUS_CONFIG = {
-  pending: { color: "text-amber-400", bg: "bg-amber-400/10 border-amber-500/20", dot: "bg-amber-400", label: "Pending" },
-  running: { color: "text-blue-400", bg: "bg-blue-400/10 border-blue-500/20", dot: "bg-blue-400 animate-pulse", label: "Running" },
-  completed: { color: "text-green-400", bg: "bg-green-400/10 border-green-500/20", dot: "bg-green-400", label: "Done" },
-  failed: { color: "text-red-400", bg: "bg-red-400/10 border-red-500/20", dot: "bg-red-400", label: "Failed" },
-  scheduled: { color: "text-purple-400", bg: "bg-purple-400/10 border-purple-500/20", dot: "bg-purple-400", label: "Scheduled" },
+// ─── Constants ────────────────────────────────────────────────────────────────
+const MODEL_LABEL = "Cerebras gpt-oss-120b";
+const MODEL_SHORT = "gpt-oss-120b";
+const FALLBACK_MODEL = "Gemini 2.0 Flash";
+
+const NAV_ITEMS = [
+  { id: "overview", label: "Overview", icon: LayoutDashboard },
+  { id: "tasks", label: "Tasks", icon: Brain },
+  { id: "logs", label: "Logs", icon: Terminal },
+  { id: "settings", label: "Settings", icon: Settings },
+] as const;
+type NavId = typeof NAV_ITEMS[number]["id"];
+
+// ─── Helpers ──────────────────────────────────────────────────────────────────
+const statusColor = (s: Task["status"]) =>
+  ({ idle: "text-slate-500", pending: "text-amber-400", running: "text-blue-400", completed: "text-green-400", failed: "text-red-400" }[s] || "text-slate-400");
+
+const statusBg = (s: Task["status"]) =>
+  ({ idle: "bg-slate-800", pending: "bg-amber-900/20 border-amber-800/30", running: "bg-blue-900/20 border-blue-800/30", completed: "bg-green-900/20 border-green-800/30", failed: "bg-red-900/20 border-red-800/30" }[s] || "bg-slate-800");
+
+const StatusIcon = ({ status }: { status: Task["status"] }) => {
+  if (status === "running") return <div className="w-4 h-4 border-2 border-blue-400 border-t-transparent rounded-full animate-spin" />;
+  if (status === "completed") return <CheckCircle2 className="w-4 h-4 text-green-400" />;
+  if (status === "failed") return <XCircle className="w-4 h-4 text-red-400" />;
+  if (status === "pending") return <Clock className="w-4 h-4 text-amber-400" />;
+  return <div className="w-4 h-4 rounded-full bg-slate-700" />;
 };
 
-function StatusBadge({ status }: { status: Task["status"] }) {
-  const cfg = STATUS_CONFIG[status] || STATUS_CONFIG.pending;
+const LogIcon = ({ type }: { type: TaskLog["log_type"] }) => {
+  if (type === "success") return <CheckCircle2 className="w-3.5 h-3.5 text-green-400 flex-shrink-0" />;
+  if (type === "error") return <XCircle className="w-3.5 h-3.5 text-red-400 flex-shrink-0" />;
+  if (type === "warning") return <AlertTriangle className="w-3.5 h-3.5 text-amber-400 flex-shrink-0" />;
+  return <Info className="w-3.5 h-3.5 text-slate-500 flex-shrink-0" />;
+};
+
+function timeAgo(iso: string) {
+  const diff = Date.now() - new Date(iso).getTime();
+  if (diff < 60000) return "just now";
+  if (diff < 3600000) return `${Math.floor(diff / 60000)}m ago`;
+  if (diff < 86400000) return `${Math.floor(diff / 3600000)}h ago`;
+  return `${Math.floor(diff / 86400000)}d ago`;
+}
+
+// ─── Components ───────────────────────────────────────────────────────────────
+function StatCard({ label, value, sub, icon: Icon, color = "blue" }: any) {
   return (
-    <span className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full border text-[11px] font-semibold ${cfg.color} ${cfg.bg}`}>
-      <span className={`w-1.5 h-1.5 rounded-full ${cfg.dot}`} />
-      {cfg.label}
-    </span>
+    <div className={`bg-slate-900 border border-slate-800 rounded-2xl p-5 flex items-start justify-between`}>
+      <div>
+        <p className="text-xs text-slate-500 font-semibold uppercase tracking-widest mb-1">{label}</p>
+        <p className="text-3xl font-extrabold text-white">{value}</p>
+        {sub && <p className="text-xs text-slate-500 mt-1">{sub}</p>}
+      </div>
+      <div className={`w-10 h-10 rounded-xl flex items-center justify-center bg-${color}-900/30 border border-${color}-800/30`}>
+        <Icon className={`w-5 h-5 text-${color}-400`} />
+      </div>
+    </div>
   );
 }
 
-function SidebarLink({ active, onClick, icon, label, badge }: {
-  active: boolean; onClick: () => void; icon: React.ReactNode; label: string; badge?: number;
-}) {
+function ModelBadge() {
   return (
-    <button
-      onClick={onClick}
-      className={`w-full flex items-center gap-3 px-3 py-2.5 rounded-xl text-sm font-medium transition-all duration-200 group ${
-        active
-          ? "bg-blue-600/20 text-blue-400 border border-blue-600/30"
-          : "text-slate-400 hover:bg-slate-800/50 hover:text-slate-200"
-      }`}
-    >
-      <span className={`${active ? "text-blue-400" : "text-slate-500 group-hover:text-slate-300"}`}>{icon}</span>
-      <span className="flex-1 text-left">{label}</span>
-      {badge !== undefined && badge > 0 && (
-        <span className="bg-blue-600 text-white text-[10px] font-bold px-1.5 py-0.5 rounded-full">{badge}</span>
-      )}
-    </button>
+    <div className="flex items-center gap-1.5 bg-purple-900/20 border border-purple-800/30 rounded-full px-3 py-1">
+      <Zap className="w-3 h-3 text-purple-400" />
+      <span className="text-xs font-bold text-purple-300">{MODEL_SHORT}</span>
+    </div>
   );
 }
 
-function StatCard({ label, value, sub, color = "text-white" }: {
-  label: string; value: string; sub?: string; color?: string;
-}) {
-  return (
-    <motion.div
-      initial={{ opacity: 0, y: 8 }}
-      animate={{ opacity: 1, y: 0 }}
-      className="bg-slate-900 border border-slate-800 rounded-2xl p-5 hover:border-slate-700 transition-colors"
-    >
-      <p className="text-[11px] uppercase font-bold tracking-widest text-slate-500 mb-3">{label}</p>
-      <p className={`text-3xl font-bold font-mono ${color}`}>{value}</p>
-      {sub && <p className="text-xs text-slate-500 mt-1">{sub}</p>}
-    </motion.div>
-  );
-}
-
-function CreateTaskModal({ onClose, onCreated }: { onClose: () => void; onCreated: () => void }) {
-  const { supabase, user } = useSupabase();
+function CreateTaskModal({ onClose, onCreated, supabase, user }: any) {
   const [name, setName] = useState("");
   const [prompt, setPrompt] = useState("");
   const [schedule, setSchedule] = useState("");
-  const [loading, setLoading] = useState(false);
+  const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
 
-  const handleSubmit = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!supabase || !name.trim() || !prompt.trim()) return;
-    setLoading(true);
+  const examples = [
+    "Navigate to https://news.ycombinator.com and extract the top 10 stories with their links and points",
+    "Go to https://weather.com and find the weather forecast for New York City for the next 3 days",
+    "Visit https://github.com/trending and list the top 5 trending repositories with their star counts",
+  ];
+
+  const handleCreate = async () => {
+    if (!name.trim() || !prompt.trim()) return;
+    setSaving(true);
     setError("");
-    const { error } = await supabase.from("tasks").insert({
+    const { data, error } = await supabase.from("tasks").insert({
       name: name.trim(),
       prompt: prompt.trim(),
-      schedule: schedule.trim() || null,
-      status: schedule.trim() ? "scheduled" : "pending",
+      schedule: schedule || null,
+      status: "idle",
       user_id: user?.id,
-    });
-    if (error) { setError(error.message); setLoading(false); return; }
-    setLoading(false);
-    onCreated();
+    }).select().single();
+    setSaving(false);
+    if (error) { setError(error.message); return; }
+    onCreated(data);
     onClose();
   };
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
-      <div className="absolute inset-0 bg-black/70 backdrop-blur-sm" onClick={onClose} />
+    <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm">
       <motion.div
-        initial={{ opacity: 0, scale: 0.96, y: 10 }}
-        animate={{ opacity: 1, scale: 1, y: 0 }}
-        className="relative bg-slate-900 border border-slate-700 rounded-2xl w-full max-w-lg shadow-2xl"
+        initial={{ scale: 0.92, opacity: 0 }}
+        animate={{ scale: 1, opacity: 1 }}
+        exit={{ scale: 0.92, opacity: 0 }}
+        className="bg-slate-900 border border-slate-700 rounded-2xl w-full max-w-lg shadow-2xl"
       >
-        <div className="flex items-center justify-between p-6 border-b border-slate-800">
-          <h2 className="text-lg font-bold text-white">Create New Task</h2>
-          <button onClick={onClose} className="text-slate-500 hover:text-white transition">
-            <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
-            </svg>
+        <div className="p-6 border-b border-slate-800 flex items-center justify-between">
+          <div>
+            <h2 className="font-bold text-white text-lg">Create Agent Task</h2>
+            <p className="text-xs text-slate-500 mt-0.5 flex items-center gap-1.5">
+              Powered by <ModelBadge />
+            </p>
+          </div>
+          <button onClick={onClose} className="p-2 rounded-xl hover:bg-slate-800 text-slate-500 hover:text-white transition">
+            <XCircle className="w-5 h-5" />
           </button>
         </div>
-        <form onSubmit={handleSubmit} className="p-6 space-y-4">
+        <div className="p-6 space-y-4">
           <div>
             <label className="block text-xs font-bold uppercase tracking-widest text-slate-500 mb-1.5">Task Name</label>
             <input
               value={name}
               onChange={e => setName(e.target.value)}
-              required
-              className="w-full bg-slate-800 border border-slate-700 rounded-xl px-4 py-3 text-sm text-white placeholder-slate-500 focus:outline-none focus:border-blue-500 transition"
-              placeholder="e.g. Daily Lead Scraper"
+              className="w-full bg-slate-800 border border-slate-700 rounded-xl px-4 py-2.5 text-sm text-white placeholder-slate-500 focus:outline-none focus:border-blue-500 transition"
+              placeholder="e.g. Daily HackerNews Monitor"
+              autoFocus
             />
           </div>
           <div>
-            <label className="block text-xs font-bold uppercase tracking-widest text-slate-500 mb-1.5">Task Prompt</label>
+            <label className="block text-xs font-bold uppercase tracking-widest text-slate-500 mb-1.5">Agent Prompt</label>
             <textarea
               value={prompt}
               onChange={e => setPrompt(e.target.value)}
-              required
+              className="w-full bg-slate-800 border border-slate-700 rounded-xl px-4 py-2.5 text-sm text-white placeholder-slate-500 focus:outline-none focus:border-blue-500 transition resize-none"
               rows={4}
-              className="w-full bg-slate-800 border border-slate-700 rounded-xl px-4 py-3 text-sm text-white placeholder-slate-500 focus:outline-none focus:border-blue-500 transition resize-none"
-              placeholder="Describe what the agent should do in detail. e.g. Go to linkedin.com, search for 'software engineer', and collect the first 10 profile URLs."
+              placeholder="Describe exactly what the agent should do..."
             />
+            <div className="mt-2 space-y-1">
+              <p className="text-xs text-slate-600 font-semibold">Examples:</p>
+              {examples.map((ex, i) => (
+                <button key={i} onClick={() => setPrompt(ex)}
+                  className="block w-full text-left text-xs text-slate-500 hover:text-slate-300 hover:bg-slate-800 px-2 py-1 rounded-lg transition truncate">
+                  {ex}
+                </button>
+              ))}
+            </div>
           </div>
           <div>
-            <label className="block text-xs font-bold uppercase tracking-widest text-slate-500 mb-1.5">Cron Schedule (Optional)</label>
+            <label className="block text-xs font-bold uppercase tracking-widest text-slate-500 mb-1.5">
+              Schedule <span className="text-slate-600 normal-case font-normal">(optional — cron or interval)</span>
+            </label>
             <input
               value={schedule}
               onChange={e => setSchedule(e.target.value)}
-              className="w-full bg-slate-800 border border-slate-700 rounded-xl px-4 py-3 text-sm text-white placeholder-slate-500 focus:outline-none focus:border-blue-500 transition font-mono"
-              placeholder="e.g. 0 9 * * * (daily at 9am)"
+              className="w-full bg-slate-800 border border-slate-700 rounded-xl px-4 py-2.5 text-sm text-white placeholder-slate-500 focus:outline-none focus:border-blue-500 transition"
+              placeholder="e.g. */30 * * * * or every_hour"
             />
-            <p className="text-xs text-slate-600 mt-1">Leave empty for manual execution</p>
           </div>
-          {error && <p className="text-red-400 text-xs bg-red-900/20 border border-red-800/30 rounded-xl p-3">{error}</p>}
-          <div className="flex gap-3 pt-2">
-            <button type="button" onClick={onClose} className="flex-1 py-2.5 rounded-xl border border-slate-700 text-slate-400 hover:text-white text-sm font-semibold transition">
-              Cancel
-            </button>
-            <button
-              type="submit"
-              disabled={loading}
-              className="flex-1 py-2.5 rounded-xl bg-blue-600 hover:bg-blue-500 disabled:opacity-50 text-white text-sm font-bold transition"
-            >
-              {loading ? "Creating..." : "Create Task"}
-            </button>
-          </div>
-        </form>
-      </motion.div>
-    </div>
-  );
-}
-
-function LogViewer({ task, onClose }: { task: Task; onClose: () => void }) {
-  const { supabase } = useSupabase();
-  const [logs, setLogs] = useState<TaskLog[]>([]);
-  const [loading, setLoading] = useState(true);
-  const bottomRef = useRef<HTMLDivElement>(null);
-
-  useEffect(() => {
-    if (!supabase) return;
-    const fetchLogs = async () => {
-      const { data } = await supabase
-        .from("task_logs")
-        .select("*")
-        .eq("task_id", task.id)
-        .order("created_at", { ascending: true });
-      if (data) setLogs(data);
-      setLoading(false);
-    };
-    fetchLogs();
-
-    // Real-time subscription
-    const sub = supabase
-      .channel(`task-logs-${task.id}`)
-      .on("postgres_changes", {
-        event: "INSERT",
-        schema: "public",
-        table: "task_logs",
-        filter: `task_id=eq.${task.id}`,
-      }, (payload) => {
-        setLogs(prev => [...prev, payload.new as TaskLog]);
-      })
-      .subscribe();
-
-    return () => { supabase.removeChannel(sub); };
-  }, [supabase, task.id]);
-
-  useEffect(() => {
-    bottomRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [logs]);
-
-  const logColors = {
-    info: "text-slate-300",
-    success: "text-green-400",
-    error: "text-red-400",
-    warning: "text-amber-400",
-  };
-
-  return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
-      <div className="absolute inset-0 bg-black/80 backdrop-blur-sm" onClick={onClose} />
-      <motion.div
-        initial={{ opacity: 0, scale: 0.96 }}
-        animate={{ opacity: 1, scale: 1 }}
-        className="relative bg-[#0a0a12] border border-slate-800 rounded-2xl w-full max-w-4xl h-[80vh] flex flex-col shadow-2xl"
-      >
-        <div className="flex items-center justify-between p-4 border-b border-slate-800">
-          <div className="flex items-center gap-3">
-            <div className="w-2 h-2 rounded-full bg-green-500 animate-pulse" />
-            <span className="font-bold text-white font-mono text-sm">{task.name}</span>
-            <StatusBadge status={task.status} />
-          </div>
-          <button onClick={onClose} className="text-slate-500 hover:text-white transition p-1 rounded-lg hover:bg-slate-800">
-            <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
-            </svg>
+          {error && <p className="text-red-400 text-sm">{error}</p>}
+        </div>
+        <div className="p-6 pt-0 flex gap-3">
+          <button onClick={onClose} className="flex-1 border border-slate-700 text-slate-300 hover:text-white hover:border-slate-600 rounded-xl py-2.5 text-sm font-semibold transition">
+            Cancel
+          </button>
+          <button
+            onClick={handleCreate}
+            disabled={!name.trim() || !prompt.trim() || saving}
+            className="flex-1 bg-blue-600 hover:bg-blue-500 disabled:opacity-50 text-white rounded-xl py-2.5 text-sm font-bold transition shadow-lg shadow-blue-600/20"
+          >
+            {saving ? "Creating..." : "Create Task"}
           </button>
         </div>
-        <div className="flex-1 overflow-y-auto p-4 font-mono text-xs space-y-1">
-          {loading ? (
-            <p className="text-slate-500 animate-pulse">Loading logs...</p>
-          ) : logs.length === 0 ? (
-            <p className="text-slate-600">No logs yet. Run the task to see output here.</p>
-          ) : (
-            logs.map(log => (
-              <div key={log.id} className="flex gap-3">
-                <span className="text-slate-600 shrink-0">{new Date(log.created_at).toLocaleTimeString()}</span>
-                <span className={logColors[log.log_type] || "text-slate-300"}>{log.message}</span>
-              </div>
-            ))
-          )}
-          <div ref={bottomRef} />
-        </div>
-        {task.result && (
-          <div className="p-4 border-t border-slate-800 bg-slate-900/50">
-            <p className="text-xs text-slate-500">
-              <span className="text-slate-400 font-semibold">Result:</span>{" "}
-              {task.result.summary || "No summary available"}
-            </p>
-          </div>
-        )}
       </motion.div>
     </div>
   );
 }
 
-function SettingsTab() {
-  const { supabase, user } = useSupabase();
-  const [cerebrasKeys, setCerebrasKeys] = useState<string[]>([]);
-  const [nopechaKey, setNopechaKey] = useState("");
+// ─── Settings Page ─────────────────────────────────────────────────────────────
+function SettingsPage({ supabase, user }: any) {
+  const [settings, setSettings] = useState<SettingsData>({ cerebras_keys: [], nopecha_key: "", gemini_key: "" });
   const [newKey, setNewKey] = useState("");
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
+  const [loading, setLoading] = useState(true);
+  const [revealedKeys, setRevealedKeys] = useState<Set<number>>(new Set());
+  const [section, setSection] = useState<"cerebras" | "captcha" | "ai" | "status">("cerebras");
 
   useEffect(() => {
     if (!supabase || !user) return;
-    supabase.from("settings").select("*").eq("user_id", user.id).single().then(({ data }) => {
-      if (data) {
-        setCerebrasKeys(data.cerebras_keys || []);
-        setNopechaKey(data.nopecha_key || "");
-      }
+    supabase.from("settings").select("*").eq("user_id", user.id).single().then(({ data }: any) => {
+      if (data) setSettings({ cerebras_keys: data.cerebras_keys || [], nopecha_key: data.nopecha_key || "", gemini_key: data.gemini_key || "" });
+      setLoading(false);
     });
   }, [supabase, user]);
 
   const addKey = () => {
-    if (newKey.trim()) {
-      setCerebrasKeys(prev => [...prev, newKey.trim()]);
-      setNewKey("");
-    }
+    const k = newKey.trim();
+    if (!k || settings.cerebras_keys.includes(k)) return;
+    setSettings(s => ({ ...s, cerebras_keys: [...s.cerebras_keys, k] }));
+    setNewKey("");
   };
 
-  const removeKey = (i: number) => setCerebrasKeys(prev => prev.filter((_, idx) => idx !== i));
+  const removeKey = (i: number) => setSettings(s => ({ ...s, cerebras_keys: s.cerebras_keys.filter((_, j) => j !== i) }));
 
   const save = async () => {
-    if (!supabase || !user) return;
     setSaving(true);
-    await supabase.from("settings").upsert({
-      user_id: user.id,
-      cerebras_keys: cerebrasKeys,
-      nopecha_key: nopechaKey,
-      updated_at: new Date().toISOString(),
-    });
+    const { error } = await supabase.from("settings").upsert({ user_id: user.id, ...settings, updated_at: new Date().toISOString() });
     setSaving(false);
-    setSaved(true);
-    setTimeout(() => setSaved(false), 2000);
+    if (!error) { setSaved(true); setTimeout(() => setSaved(false), 2500); }
   };
 
+  const sections = [
+    { id: "cerebras", label: "Cerebras AI", icon: Zap },
+    { id: "captcha", label: "CAPTCHA Solver", icon: Globe },
+    { id: "ai", label: "Vision AI", icon: Eye },
+    { id: "status", label: "System Status", icon: Activity },
+  ] as const;
+
+  if (loading) return (
+    <div className="flex items-center gap-3 text-slate-500 text-sm">
+      <div className="w-4 h-4 border-2 border-slate-700 border-t-blue-500 rounded-full animate-spin" />
+      Loading settings...
+    </div>
+  );
+
   return (
-    <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} className="max-w-2xl space-y-6">
+    <div className="max-w-2xl space-y-6">
       <div>
-        <h2 className="text-xl font-bold text-white mb-1">API Configuration</h2>
-        <p className="text-sm text-slate-500">Manage your API keys for agent orchestration.</p>
+        <h2 className="text-xl font-bold text-white">Settings</h2>
+        <p className="text-sm text-slate-500 mt-1">Configure API keys and agent system parameters.</p>
       </div>
 
-      <div className="bg-slate-900 border border-slate-800 rounded-2xl p-6 space-y-4">
-        <div>
-          <h3 className="text-sm font-bold text-white mb-1">Cerebras AI Keys</h3>
-          <p className="text-xs text-slate-500 mb-4">Keys are rotated automatically for high-throughput tasks.</p>
-          <div className="space-y-2">
-            {cerebrasKeys.map((key, i) => (
-              <div key={i} className="flex items-center gap-2">
-                <span className="flex-1 bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-xs font-mono text-slate-400">
-                  {"•".repeat(20)}...{key.slice(-6)}
+      <div className="flex gap-2 flex-wrap">
+        {sections.map(s => (
+          <button key={s.id} onClick={() => setSection(s.id)}
+            className={`flex items-center gap-2 px-4 py-2 rounded-xl text-sm font-semibold border transition ${section === s.id ? "bg-blue-600/20 text-blue-400 border-blue-600/30" : "text-slate-400 border-slate-800 hover:border-slate-700 hover:text-white"}`}>
+            <s.icon className="w-3.5 h-3.5" />
+            {s.label}
+          </button>
+        ))}
+      </div>
+
+      <AnimatePresence mode="wait">
+        {section === "cerebras" && (
+          <motion.div key="c" initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0 }}>
+            <div className="bg-slate-900 border border-slate-800 rounded-2xl p-6 space-y-5">
+              <div className="flex items-start justify-between">
+                <div>
+                  <h3 className="font-bold text-white flex items-center gap-2">
+                    <Zap className="w-4 h-4 text-purple-400" />
+                    Cerebras Key Pool
+                  </h3>
+                  <p className="text-xs text-slate-500 mt-1">Model: <span className="text-purple-300 font-mono">{MODEL_LABEL}</span></p>
+                  <p className="text-xs text-slate-500">Add unlimited keys — the agent rotates through them automatically to avoid rate limits.</p>
+                </div>
+                <span className="bg-purple-900/30 text-purple-300 text-xs font-bold px-3 py-1 rounded-full border border-purple-800/30">
+                  {settings.cerebras_keys.length} key{settings.cerebras_keys.length !== 1 ? "s" : ""}
                 </span>
-                <button onClick={() => removeKey(i)} className="text-red-500 hover:text-red-400 p-2 rounded-lg hover:bg-red-900/20 transition">
-                  <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
-                  </svg>
-                </button>
               </div>
-            ))}
-            <div className="flex gap-2 mt-3">
-              <input
-                value={newKey}
-                onChange={e => setNewKey(e.target.value)}
-                onKeyDown={e => e.key === "Enter" && addKey()}
-                type="password"
-                className="flex-1 bg-slate-800 border border-slate-700 rounded-xl px-3 py-2.5 text-sm text-white placeholder-slate-500 focus:outline-none focus:border-blue-500 transition"
-                placeholder="Add API key..."
-              />
-              <button onClick={addKey} className="bg-blue-600 hover:bg-blue-500 text-white px-4 py-2.5 rounded-xl text-sm font-semibold transition">
-                Add
-              </button>
+
+              <div className="space-y-2">
+                <AnimatePresence>
+                  {settings.cerebras_keys.length === 0 ? (
+                    <div className="text-center py-8 border border-dashed border-slate-800 rounded-xl">
+                      <Key className="w-8 h-8 text-slate-700 mx-auto mb-2" />
+                      <p className="text-sm text-slate-600">No keys added. Add a Cerebras key below.</p>
+                    </div>
+                  ) : settings.cerebras_keys.map((key, i) => (
+                    <motion.div key={i} initial={{ opacity: 0, height: 0 }} animate={{ opacity: 1, height: "auto" }} exit={{ opacity: 0, height: 0 }}
+                      className="flex items-center gap-2">
+                      <div className="flex-1 flex items-center gap-2 bg-slate-800 border border-slate-700 rounded-xl px-3 py-2.5">
+                        <Zap className="w-3.5 h-3.5 text-purple-400 flex-shrink-0" />
+                        <span className="text-xs font-mono text-slate-300 flex-1">
+                          {revealedKeys.has(i) ? key : key.slice(0, 8) + "•".repeat(20) + key.slice(-6)}
+                        </span>
+                        <button onClick={() => setRevealedKeys(s => { const n = new Set(s); n.has(i) ? n.delete(i) : n.add(i); return n; })}
+                          className="p-1 text-slate-600 hover:text-slate-300 transition">
+                          {revealedKeys.has(i) ? <EyeOff className="w-3.5 h-3.5" /> : <Eye className="w-3.5 h-3.5" />}
+                        </button>
+                      </div>
+                      <button onClick={() => removeKey(i)} className="p-2 rounded-xl text-slate-600 hover:text-red-400 hover:bg-red-900/20 transition">
+                        <Trash2 className="w-4 h-4" />
+                      </button>
+                    </motion.div>
+                  ))}
+                </AnimatePresence>
+              </div>
+
+              <div className="space-y-2">
+                <label className="block text-xs font-bold uppercase tracking-widest text-slate-500">Add Cerebras Key</label>
+                <div className="flex gap-2">
+                  <input
+                    value={newKey}
+                    onChange={e => setNewKey(e.target.value)}
+                    onKeyDown={e => e.key === "Enter" && addKey()}
+                    type="password"
+                    className="flex-1 bg-slate-800 border border-slate-700 rounded-xl px-4 py-2.5 text-sm text-white placeholder-slate-500 focus:outline-none focus:border-purple-500 transition font-mono"
+                    placeholder="csk-..."
+                  />
+                  <button onClick={addKey} disabled={!newKey.trim()}
+                    className="bg-purple-600 hover:bg-purple-500 disabled:opacity-40 text-white px-5 py-2.5 rounded-xl text-sm font-bold transition">
+                    Add
+                  </button>
+                </div>
+              </div>
+
+              {settings.cerebras_keys.length > 1 && (
+                <div className="p-3 bg-purple-900/10 border border-purple-800/20 rounded-xl">
+                  <p className="text-xs text-purple-300">
+                    <span className="font-bold">Key rotation active</span> — {settings.cerebras_keys.length} keys cycling round-robin (~{settings.cerebras_keys.length * 60} req/min capacity)
+                  </p>
+                </div>
+              )}
             </div>
-          </div>
-        </div>
-      </div>
 
-      <div className="bg-slate-900 border border-slate-800 rounded-2xl p-6">
-        <h3 className="text-sm font-bold text-white mb-1">NopeCHA CAPTCHA Solver</h3>
-        <p className="text-xs text-slate-500 mb-4">Used for automatic CAPTCHA solving during agent tasks.</p>
-        <input
-          value={nopechaKey}
-          onChange={e => setNopechaKey(e.target.value)}
-          type="password"
-          className="w-full bg-slate-800 border border-slate-700 rounded-xl px-4 py-3 text-sm text-white placeholder-slate-500 focus:outline-none focus:border-blue-500 transition"
-          placeholder="nopecha_..."
-        />
-      </div>
+            <button onClick={save} disabled={saving}
+              className="mt-4 bg-purple-600 hover:bg-purple-500 disabled:opacity-50 text-white font-bold px-8 py-3 rounded-xl transition shadow-lg shadow-purple-600/20 flex items-center gap-2">
+              {saved ? <><CheckCircle2 className="w-4 h-4" /> Saved!</> : saving ? "Saving..." : "Save Settings"}
+            </button>
+          </motion.div>
+        )}
 
-      <button
-        onClick={save}
-        disabled={saving}
-        className="w-full bg-blue-600 hover:bg-blue-500 disabled:opacity-50 text-white font-bold py-3 rounded-xl transition"
-      >
-        {saving ? "Saving..." : saved ? "Saved!" : "Save Settings"}
-      </button>
-    </motion.div>
+        {section === "captcha" && (
+          <motion.div key="cap" initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0 }}>
+            <div className="bg-slate-900 border border-slate-800 rounded-2xl p-6 space-y-4">
+              <h3 className="font-bold text-white flex items-center gap-2"><Globe className="w-4 h-4 text-green-400" /> CAPTCHA Solver (NopeCHA)</h3>
+              <p className="text-xs text-slate-500">Automatically bypasses CAPTCHAs encountered during agent tasks.</p>
+              <div>
+                <label className="block text-xs font-bold uppercase tracking-widest text-slate-500 mb-1.5">NopeCHA API Key</label>
+                <input value={settings.nopecha_key} onChange={e => setSettings(s => ({ ...s, nopecha_key: e.target.value }))} type="password"
+                  className="w-full bg-slate-800 border border-slate-700 rounded-xl px-4 py-2.5 text-sm text-white placeholder-slate-500 focus:outline-none focus:border-blue-500 transition font-mono"
+                  placeholder="nopecha_..." />
+              </div>
+              <div className="grid grid-cols-2 gap-2 pt-1">
+                {[["reCAPTCHA v2", "✓"], ["reCAPTCHA v3", "✓"], ["hCaptcha", "✓"], ["Cloudflare Turnstile", "✓"], ["CF JS Challenge", "Auto-wait"], ["Funcaptcha", "✓"]].map(([name, s]) => (
+                  <div key={name} className="flex items-center gap-2 bg-slate-800 rounded-xl px-3 py-2">
+                    <span className="text-green-400 text-xs font-bold">{s}</span>
+                    <span className="text-xs text-slate-400">{name}</span>
+                  </div>
+                ))}
+              </div>
+            </div>
+            <button onClick={save} disabled={saving} className="mt-4 bg-blue-600 hover:bg-blue-500 disabled:opacity-50 text-white font-bold px-8 py-3 rounded-xl transition">
+              {saving ? "Saving..." : saved ? "Saved!" : "Save Settings"}
+            </button>
+          </motion.div>
+        )}
+
+        {section === "ai" && (
+          <motion.div key="ai" initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0 }}>
+            <div className="bg-slate-900 border border-slate-800 rounded-2xl p-6 space-y-4">
+              <h3 className="font-bold text-white flex items-center gap-2"><Eye className="w-4 h-4 text-blue-400" /> Vision AI (Google Gemini)</h3>
+              <p className="text-xs text-slate-500">Used as vision fallback for screenshot-based page analysis. Primary text reasoning uses Cerebras {MODEL_SHORT}.</p>
+              <div>
+                <label className="block text-xs font-bold uppercase tracking-widest text-slate-500 mb-1.5">Gemini API Key</label>
+                <input value={settings.gemini_key} onChange={e => setSettings(s => ({ ...s, gemini_key: e.target.value }))} type="password"
+                  className="w-full bg-slate-800 border border-slate-700 rounded-xl px-4 py-2.5 text-sm text-white placeholder-slate-500 focus:outline-none focus:border-blue-500 transition font-mono"
+                  placeholder="AIza..." />
+              </div>
+              <div className="grid grid-cols-2 gap-3 bg-slate-800 rounded-xl p-4 text-xs">
+                <div><p className="text-slate-500">Primary (text/reasoning)</p><p className="font-mono text-purple-300 mt-0.5">{MODEL_LABEL}</p></div>
+                <div><p className="text-slate-500">Fallback (vision)</p><p className="font-mono text-blue-300 mt-0.5">{FALLBACK_MODEL}</p></div>
+              </div>
+            </div>
+            <button onClick={save} disabled={saving} className="mt-4 bg-blue-600 hover:bg-blue-500 disabled:opacity-50 text-white font-bold px-8 py-3 rounded-xl transition">
+              {saving ? "Saving..." : saved ? "Saved!" : "Save Settings"}
+            </button>
+          </motion.div>
+        )}
+
+        {section === "status" && (
+          <motion.div key="st" initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0 }}>
+            <div className="bg-slate-900 border border-slate-800 rounded-2xl p-6 space-y-0">
+              <h3 className="font-bold text-white mb-4 flex items-center gap-2"><Activity className="w-4 h-4 text-green-400" /> System Status</h3>
+              {[
+                ["Primary AI", `Cerebras ${MODEL_SHORT}`, "ok"],
+                ["Vision AI", FALLBACK_MODEL, "ok"],
+                ["Browser Use", "Python agent (enabled)", "ok"],
+                ["Playwright", "Fallback (enabled)", "ok"],
+                ["Supabase", "Connected", "ok"],
+                ["GitHub Actions", "10-min schedule", "ok"],
+                ["GitHub Pages", "joshbond123.github.io/AutoAgent", "ok"],
+                ["CAPTCHA Solver", settings.nopecha_key ? `NopeCHA configured` : "Not configured", settings.nopecha_key ? "ok" : "warn"],
+                ["Cerebras Keys", `${settings.cerebras_keys.length} key(s) in pool`, settings.cerebras_keys.length > 0 ? "ok" : "warn"],
+              ].map(([label, value, status]) => (
+                <div key={label as string} className="flex items-center justify-between py-3 border-b border-slate-800 last:border-0">
+                  <span className="text-sm text-slate-400">{label}</span>
+                  <div className="flex items-center gap-2">
+                    <span className="text-xs font-mono text-slate-300">{value}</span>
+                    <div className={`w-2 h-2 rounded-full ${status === "ok" ? "bg-green-400" : "bg-amber-400"}`} />
+                  </div>
+                </div>
+              ))}
+            </div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+    </div>
   );
 }
 
+// ─── Main Dashboard ───────────────────────────────────────────────────────────
 export default function Dashboard() {
   const { supabase, user, signOut } = useSupabase();
+  const [nav, setNav] = useState<NavId>("overview");
   const [tasks, setTasks] = useState<Task[]>([]);
-  const [activeTab, setActiveTab] = useState<Tab>("dashboard");
-  const [showCreateModal, setShowCreateModal] = useState(false);
+  const [logs, setLogs] = useState<TaskLog[]>([]);
   const [selectedTask, setSelectedTask] = useState<Task | null>(null);
-  const [deleting, setDeleting] = useState<string | null>(null);
-  const [runningTask, setRunningTask] = useState<string | null>(null);
+  const [showCreate, setShowCreate] = useState(false);
+  const [refreshing, setRefreshing] = useState(false);
+  const [sidebarOpen, setSidebarOpen] = useState(true);
+  const logsEndRef = useRef<HTMLDivElement>(null);
 
-  const fetchTasks = useCallback(async () => {
-    if (!supabase) return;
-    const { data } = await supabase.from("tasks").select("*").order("created_at", { ascending: false });
+  // ── Data loading ──────────────────────────────────────────────────────────
+  const loadTasks = async () => {
+    if (!supabase || !user) return;
+    const { data } = await supabase.from("tasks").select("*").eq("user_id", user.id).order("created_at", { ascending: false });
     if (data) setTasks(data);
-  }, [supabase]);
+  };
 
+  const loadLogs = async (taskId?: string) => {
+    if (!supabase) return;
+    let q = supabase.from("task_logs").select("*").order("created_at", { ascending: false }).limit(200);
+    if (taskId) q = q.eq("task_id", taskId);
+    const { data } = await q;
+    if (data) setLogs(data.reverse());
+  };
+
+  useEffect(() => { loadTasks(); }, [supabase, user]);
+  useEffect(() => { loadLogs(selectedTask?.id); }, [selectedTask, supabase]);
+
+  // ── Real-time task updates ────────────────────────────────────────────────
   useEffect(() => {
-    fetchTasks();
-    // Real-time task updates
-    if (!supabase) return;
-    const sub = supabase
-      .channel("tasks-realtime")
-      .on("postgres_changes", { event: "*", schema: "public", table: "tasks" }, () => fetchTasks())
+    if (!supabase || !user) return;
+    const ch = supabase.channel("tasks-realtime")
+      .on("postgres_changes", { event: "*", schema: "public", table: "tasks" }, () => loadTasks())
+      .on("postgres_changes", { event: "INSERT", schema: "public", table: "task_logs" }, ({ new: log }) => {
+        setLogs(prev => [...prev.slice(-199), log as TaskLog]);
+        setTimeout(() => logsEndRef.current?.scrollIntoView({ behavior: "smooth" }), 100);
+      })
       .subscribe();
-    return () => { supabase.removeChannel(sub); };
-  }, [supabase, fetchTasks]);
+    return () => { supabase.removeChannel(ch); };
+  }, [supabase, user]);
 
-  const handleRunTask = async (task: Task) => {
+  const refresh = async () => {
+    setRefreshing(true);
+    await Promise.all([loadTasks(), loadLogs(selectedTask?.id)]);
+    setRefreshing(false);
+  };
+
+  const runTask = async (task: Task) => {
     if (!supabase) return;
-    setRunningTask(task.id);
     await supabase.from("tasks").update({ status: "pending" }).eq("id", task.id);
-    // Trigger GitHub Actions dispatch
-    try {
-      await fetch(`https://api.github.com/repos/Joshbond123/AutoAgent/actions/workflows/agent-task.yml/dispatches`, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "Accept": "application/vnd.github+json",
-        },
-        body: JSON.stringify({ ref: "main", inputs: { taskId: task.id } }),
-      });
-    } catch (_) {}
-    fetchTasks();
-    setRunningTask(null);
+    await supabase.from("task_logs").insert({ task_id: task.id, message: `Task queued for Cerebras ${MODEL_SHORT} agent`, log_type: "info" });
+    await loadTasks();
   };
 
-  const handleDeleteTask = async (taskId: string) => {
-    if (!supabase || !confirm("Delete this task?")) return;
-    setDeleting(taskId);
-    await supabase.from("tasks").delete().eq("id", taskId);
-    fetchTasks();
-    setDeleting(null);
+  const deleteTask = async (task: Task) => {
+    if (!supabase || !confirm(`Delete "${task.name}"?`)) return;
+    await supabase.from("task_logs").delete().eq("task_id", task.id);
+    await supabase.from("tasks").delete().eq("id", task.id);
+    if (selectedTask?.id === task.id) setSelectedTask(null);
+    await loadTasks();
   };
 
-  const stats = {
-    total: tasks.length,
-    running: tasks.filter(t => t.status === "running").length,
-    completed: tasks.filter(t => t.status === "completed").length,
-    failed: tasks.filter(t => t.status === "failed").length,
-    successRate: tasks.length > 0
-      ? Math.round((tasks.filter(t => t.status === "completed").length / Math.max(tasks.filter(t => ["completed","failed"].includes(t.status)).length, 1)) * 100)
-      : 0,
-  };
+  // ── Stats ─────────────────────────────────────────────────────────────────
+  const running = tasks.filter(t => t.status === "running").length;
+  const completed = tasks.filter(t => t.status === "completed").length;
+  const failed = tasks.filter(t => t.status === "failed").length;
+  const pending = tasks.filter(t => t.status === "pending").length;
 
+  // ── Render ────────────────────────────────────────────────────────────────
   return (
-    <div className="flex h-screen bg-[#0f172a] text-slate-200 overflow-hidden">
+    <div className="flex h-screen bg-[#0a0a0f] text-white overflow-hidden">
       {/* Sidebar */}
-      <aside className="w-60 shrink-0 border-r border-slate-800 bg-[#020617] flex flex-col">
-        <div className="flex items-center gap-3 px-5 py-6 border-b border-slate-800/50">
-          <div className="w-8 h-8 rounded-xl bg-blue-600 flex items-center justify-center shadow-lg shadow-blue-600/30">
-            <svg className="w-4 h-4 text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9.75 17L9 20l-1 1h8l-1-1-.75-3M3 13h18M5 17h14a2 2 0 002-2V5a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z" />
-            </svg>
+      <motion.aside
+        animate={{ width: sidebarOpen ? 220 : 64 }}
+        className="flex-shrink-0 bg-slate-950 border-r border-slate-900 flex flex-col overflow-hidden"
+      >
+        {/* Logo */}
+        <div className="p-4 border-b border-slate-900 flex items-center gap-3">
+          <div className="w-8 h-8 rounded-xl bg-gradient-to-br from-purple-600 to-blue-600 flex items-center justify-center flex-shrink-0">
+            <Brain className="w-4 h-4 text-white" />
           </div>
-          <div>
-            <p className="font-bold text-white text-sm leading-none">AutoAgent</p>
-            <p className="text-[10px] text-blue-400 font-mono mt-0.5">PRO</p>
-          </div>
+          {sidebarOpen && (
+            <div className="overflow-hidden">
+              <p className="text-sm font-extrabold text-white whitespace-nowrap">AutoAgent Pro</p>
+              <p className="text-[10px] text-purple-400 font-mono whitespace-nowrap">{MODEL_SHORT}</p>
+            </div>
+          )}
         </div>
 
-        <nav className="flex-1 p-3 space-y-1">
-          <SidebarLink active={activeTab === "dashboard"} onClick={() => setActiveTab("dashboard")} label="Dashboard"
-            icon={<svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 6a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2H6a2 2 0 01-2-2V6zm10 0a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2h-2a2 2 0 01-2-2V6zM4 16a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2H6a2 2 0 01-2-2v-2zm10 0a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2h-2a2 2 0 01-2-2v-2z" /></svg>}
-          />
-          <SidebarLink active={activeTab === "tasks"} onClick={() => setActiveTab("tasks")} label="All Tasks"
-            badge={stats.running}
-            icon={<svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2" /></svg>}
-          />
-          <SidebarLink active={activeTab === "history"} onClick={() => setActiveTab("history")} label="Run History"
-            icon={<svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" /></svg>}
-          />
-          <SidebarLink active={activeTab === "settings"} onClick={() => setActiveTab("settings")} label="Settings"
-            icon={<svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z" /><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" /></svg>}
-          />
+        {/* Nav */}
+        <nav className="flex-1 p-2 space-y-1">
+          {NAV_ITEMS.map(({ id, label, icon: Icon }) => (
+            <button key={id} onClick={() => setNav(id)}
+              className={`w-full flex items-center gap-3 px-3 py-2.5 rounded-xl text-sm font-semibold transition ${nav === id ? "bg-blue-600/20 text-blue-400" : "text-slate-500 hover:text-white hover:bg-slate-800"}`}>
+              <Icon className="w-4 h-4 flex-shrink-0" />
+              {sidebarOpen && <span className="whitespace-nowrap">{label}</span>}
+            </button>
+          ))}
         </nav>
 
-        <div className="p-3 border-t border-slate-800/50">
-          <div className="flex items-center gap-2 px-3 py-2 rounded-xl bg-slate-900 border border-slate-800 mb-2">
-            <div className="w-6 h-6 rounded-full bg-blue-600/30 flex items-center justify-center">
-              <span className="text-blue-400 text-[10px] font-bold">{user?.email?.[0]?.toUpperCase() || "U"}</span>
+        {/* User */}
+        <div className="p-2 border-t border-slate-900">
+          {sidebarOpen && (
+            <div className="px-3 py-2 mb-1">
+              <p className="text-xs text-slate-500 truncate">{user?.email}</p>
             </div>
-            <span className="text-xs text-slate-400 truncate flex-1">{user?.email?.split("@")[0]}</span>
-          </div>
-          <button
-            onClick={signOut}
-            className="w-full flex items-center gap-2 px-3 py-2 rounded-xl text-slate-500 hover:text-red-400 hover:bg-red-900/10 transition text-xs font-medium"
-          >
-            <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M17 16l4-4m0 0l-4-4m4 4H7m6 4v1a3 3 0 01-3 3H6a3 3 0 01-3-3V7a3 3 0 013-3h4a3 3 0 013 3v1" />
-            </svg>
-            Sign Out
+          )}
+          <button onClick={signOut}
+            className="w-full flex items-center gap-3 px-3 py-2.5 rounded-xl text-sm text-slate-500 hover:text-red-400 hover:bg-red-900/10 transition">
+            <XCircle className="w-4 h-4 flex-shrink-0" />
+            {sidebarOpen && "Sign out"}
           </button>
         </div>
-      </aside>
+      </motion.aside>
 
-      {/* Main */}
-      <div className="flex-1 flex flex-col min-w-0">
+      {/* Main content */}
+      <div className="flex-1 flex flex-col min-w-0 overflow-hidden">
         {/* Header */}
-        <header className="h-14 border-b border-slate-800 flex items-center justify-between px-6 shrink-0 bg-[#0f172a]">
-          <div className="flex items-center gap-2">
-            {stats.running > 0 && (
-              <div className="flex items-center gap-2 px-3 py-1 bg-blue-600/10 border border-blue-600/30 rounded-full">
-                <div className="w-2 h-2 rounded-full bg-blue-500 animate-pulse" />
-                <span className="text-xs font-medium text-blue-400">{stats.running} agent{stats.running > 1 ? "s" : ""} running</span>
+        <header className="flex-shrink-0 border-b border-slate-900 bg-slate-950/50 backdrop-blur px-6 py-4 flex items-center justify-between">
+          <div className="flex items-center gap-4">
+            <button onClick={() => setSidebarOpen(s => !s)}
+              className="p-1.5 rounded-lg text-slate-500 hover:text-white hover:bg-slate-800 transition">
+              <Layers className="w-4 h-4" />
+            </button>
+            <div>
+              <h1 className="text-lg font-bold text-white capitalize">{nav}</h1>
+              <div className="flex items-center gap-2 mt-0.5">
+                <ModelBadge />
+                {running > 0 && (
+                  <span className="flex items-center gap-1 text-xs text-blue-400">
+                    <div className="w-1.5 h-1.5 rounded-full bg-blue-400 animate-pulse" />
+                    {running} running
+                  </span>
+                )}
               </div>
+            </div>
+          </div>
+          <div className="flex items-center gap-2">
+            <button onClick={refresh} disabled={refreshing}
+              className="p-2 rounded-xl text-slate-500 hover:text-white hover:bg-slate-800 transition">
+              <RefreshCw className={`w-4 h-4 ${refreshing ? "animate-spin" : ""}`} />
+            </button>
+            {nav === "tasks" && (
+              <button onClick={() => setShowCreate(true)}
+                className="flex items-center gap-2 bg-blue-600 hover:bg-blue-500 text-white text-sm font-bold px-4 py-2 rounded-xl transition shadow-lg shadow-blue-600/20">
+                <PlusCircle className="w-4 h-4" />
+                New Task
+              </button>
             )}
           </div>
-          <button
-            onClick={() => setShowCreateModal(true)}
-            className="flex items-center gap-2 bg-blue-600 hover:bg-blue-500 text-white font-bold px-4 py-2 rounded-xl text-sm transition shadow-lg shadow-blue-600/20"
-          >
-            <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 4v16m8-8H4" />
-            </svg>
-            New Task
-          </button>
         </header>
 
-        <div className="flex-1 overflow-y-auto p-6">
+        {/* Page content */}
+        <main className="flex-1 overflow-y-auto p-6">
           <AnimatePresence mode="wait">
-            {activeTab === "dashboard" && (
-              <motion.div key="dash" initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0 }} className="space-y-6">
-                <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
-                  <StatCard label="Total Tasks" value={stats.total.toString()} sub="All time" />
-                  <StatCard label="Running" value={stats.running.toString()} sub="Right now" color="text-blue-400" />
-                  <StatCard label="Completed" value={stats.completed.toString()} sub="Successful" color="text-green-400" />
-                  <StatCard label="Success Rate" value={`${stats.successRate}%`} sub="Completed vs failed" color="text-purple-400" />
+            {/* ── Overview ── */}
+            {nav === "overview" && (
+              <motion.div key="overview" initial={{ opacity: 0, y: 12 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0 }}>
+                <div className="grid grid-cols-2 lg:grid-cols-4 gap-4 mb-8">
+                  <StatCard label="Total Tasks" value={tasks.length} icon={Brain} color="blue" sub="All time" />
+                  <StatCard label="Running" value={running} icon={Activity} color="blue" sub={running ? "Active now" : "Idle"} />
+                  <StatCard label="Completed" value={completed} icon={CheckCircle2} color="green" sub="Successfully" />
+                  <StatCard label="Failed" value={failed} icon={XCircle} color="red" sub={pending ? `${pending} pending` : "No failures"} />
                 </div>
 
-                <div className="bg-slate-900 border border-slate-800 rounded-2xl overflow-hidden">
-                  <div className="flex items-center justify-between px-6 py-4 border-b border-slate-800">
-                    <h3 className="text-sm font-bold text-white">Recent Tasks</h3>
-                    <button onClick={() => setActiveTab("tasks")} className="text-xs text-blue-400 hover:text-blue-300 transition">View all</button>
-                  </div>
-                  {tasks.length === 0 ? (
-                    <div className="p-12 text-center">
-                      <div className="w-12 h-12 rounded-2xl bg-slate-800 flex items-center justify-center mx-auto mb-3">
-                        <svg className="w-6 h-6 text-slate-600" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2" />
-                        </svg>
+                {/* AI Info card */}
+                <div className="bg-slate-900 border border-purple-800/30 rounded-2xl p-6 mb-6">
+                  <div className="flex items-start gap-4">
+                    <div className="w-12 h-12 rounded-2xl bg-gradient-to-br from-purple-600 to-blue-600 flex items-center justify-center flex-shrink-0">
+                      <Zap className="w-6 h-6 text-white" />
+                    </div>
+                    <div className="flex-1">
+                      <h3 className="font-bold text-white">Cerebras Wafer-Scale Engine</h3>
+                      <p className="text-sm text-slate-400 mt-1">
+                        Running <span className="text-purple-300 font-mono font-bold">{MODEL_LABEL}</span> for agent reasoning.
+                        Vision tasks fall back to <span className="text-blue-300">{FALLBACK_MODEL}</span>.
+                        CAPTCHA solving powered by NopeCHA (reCAPTCHA, hCaptcha, Turnstile).
+                      </p>
+                      <div className="flex flex-wrap gap-2 mt-3">
+                        {["Ultra-fast inference", "Key rotation", "Auto CAPTCHA bypass", "Human-like browsing", "Session persistence"].map(f => (
+                          <span key={f} className="text-xs bg-slate-800 text-slate-300 px-3 py-1 rounded-full">{f}</span>
+                        ))}
                       </div>
-                      <p className="text-slate-500 text-sm">No tasks yet.</p>
-                      <button onClick={() => setShowCreateModal(true)} className="mt-3 text-blue-400 hover:text-blue-300 text-sm font-semibold transition">
-                        Create your first task
+                    </div>
+                  </div>
+                </div>
+
+                {/* Recent tasks */}
+                <div>
+                  <h3 className="text-sm font-bold text-slate-400 uppercase tracking-widest mb-3">Recent Tasks</h3>
+                  {tasks.length === 0 ? (
+                    <div className="text-center py-12 border border-dashed border-slate-800 rounded-2xl">
+                      <Brain className="w-10 h-10 text-slate-700 mx-auto mb-3" />
+                      <p className="text-slate-500">No tasks yet. Create one to get started.</p>
+                      <button onClick={() => { setNav("tasks"); setShowCreate(true); }}
+                        className="mt-4 bg-blue-600 hover:bg-blue-500 text-white text-sm font-bold px-6 py-2.5 rounded-xl transition">
+                        Create Task
                       </button>
                     </div>
-                  ) : (
-                    <div className="divide-y divide-slate-800">
-                      {tasks.slice(0, 5).map(task => (
-                        <div key={task.id} className="flex items-center gap-4 px-6 py-4 hover:bg-slate-800/30 transition">
-                          <div className="flex-1 min-w-0">
-                            <p className="text-sm font-semibold text-white truncate">{task.name}</p>
-                            <p className="text-xs text-slate-500 truncate mt-0.5">{task.prompt}</p>
-                          </div>
-                          <StatusBadge status={task.status} />
-                          <p className="text-xs text-slate-600 hidden md:block w-32 text-right">{formatDate(task.last_run || task.created_at)}</p>
-                          <div className="flex gap-1">
-                            <button onClick={() => setSelectedTask(task)} className="p-2 rounded-lg text-slate-500 hover:text-blue-400 hover:bg-blue-900/20 transition">
-                              <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
-                              </svg>
-                            </button>
-                            <button
-                              onClick={() => handleRunTask(task)}
-                              disabled={task.status === "running" || runningTask === task.id}
-                              className="p-2 rounded-lg text-slate-500 hover:text-green-400 hover:bg-green-900/20 transition disabled:opacity-40"
-                            >
-                              <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M14.752 11.168l-3.197-2.132A1 1 0 0010 9.87v4.263a1 1 0 001.555.832l3.197-2.132a1 1 0 000-1.664z" /><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
-                              </svg>
-                            </button>
-                          </div>
-                        </div>
-                      ))}
+                  ) : tasks.slice(0, 5).map(task => (
+                    <div key={task.id} onClick={() => { setSelectedTask(task); setNav("logs"); }}
+                      className={`flex items-center gap-4 p-4 rounded-xl border mb-2 cursor-pointer hover:border-slate-700 transition ${statusBg(task.status)}`}>
+                      <StatusIcon status={task.status} />
+                      <div className="flex-1 min-w-0">
+                        <p className="text-sm font-semibold text-white truncate">{task.name}</p>
+                        <p className="text-xs text-slate-500 truncate">{task.prompt}</p>
+                      </div>
+                      <span className={`text-xs font-bold uppercase ${statusColor(task.status)}`}>{task.status}</span>
+                      <ChevronRight className="w-4 h-4 text-slate-600" />
                     </div>
-                  )}
+                  ))}
                 </div>
               </motion.div>
             )}
 
-            {activeTab === "tasks" && (
-              <motion.div key="tasks" initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0 }} className="space-y-4">
-                <div className="flex items-center justify-between">
-                  <h2 className="text-xl font-bold text-white">All Tasks</h2>
-                  <span className="text-xs text-slate-500 bg-slate-800 px-3 py-1 rounded-full">{tasks.length} total</span>
-                </div>
-                {tasks.length === 0 ? (
-                  <div className="bg-slate-900 border border-slate-800 rounded-2xl p-12 text-center">
-                    <p className="text-slate-500">No tasks created yet. Click "New Task" to get started.</p>
-                  </div>
-                ) : (
-                  <div className="bg-slate-900 border border-slate-800 rounded-2xl overflow-hidden">
-                    <div className="divide-y divide-slate-800">
-                      {tasks.map(task => (
-                        <motion.div
-                          key={task.id}
-                          layout
-                          className="flex items-center gap-4 px-6 py-4 hover:bg-slate-800/30 transition group"
-                        >
-                          <div className="flex-1 min-w-0">
-                            <div className="flex items-center gap-2">
-                              <p className="text-sm font-semibold text-white">{task.name}</p>
-                              {task.schedule && (
-                                <span className="text-[10px] font-mono text-purple-400 bg-purple-900/20 border border-purple-800/30 px-2 py-0.5 rounded-full">
-                                  {task.schedule}
-                                </span>
-                              )}
-                            </div>
-                            <p className="text-xs text-slate-500 truncate mt-0.5 max-w-md">{task.prompt}</p>
-                          </div>
-                          <StatusBadge status={task.status} />
-                          <p className="text-xs text-slate-600 w-36 text-right hidden lg:block">{formatDate(task.last_run || task.created_at)}</p>
-                          <div className="flex gap-1 opacity-0 group-hover:opacity-100 transition">
-                            <button onClick={() => setSelectedTask(task)} className="p-2 rounded-lg text-slate-500 hover:text-blue-400 hover:bg-blue-900/20 transition" title="View logs">
-                              <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
-                              </svg>
-                            </button>
-                            <button
-                              onClick={() => handleRunTask(task)}
-                              disabled={task.status === "running" || runningTask === task.id}
-                              className="p-2 rounded-lg text-slate-500 hover:text-green-400 hover:bg-green-900/20 transition disabled:opacity-40"
-                              title="Run now"
-                            >
-                              <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M14.752 11.168l-3.197-2.132A1 1 0 0010 9.87v4.263a1 1 0 001.555.832l3.197-2.132a1 1 0 000-1.664z" /><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
-                              </svg>
-                            </button>
-                            <button
-                              onClick={() => handleDeleteTask(task.id)}
-                              disabled={deleting === task.id}
-                              className="p-2 rounded-lg text-slate-500 hover:text-red-400 hover:bg-red-900/20 transition disabled:opacity-40"
-                              title="Delete"
-                            >
-                              <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
-                              </svg>
-                            </button>
-                          </div>
-                        </motion.div>
-                      ))}
-                    </div>
+            {/* ── Tasks ── */}
+            {nav === "tasks" && (
+              <motion.div key="tasks" initial={{ opacity: 0, y: 12 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0 }} className="space-y-3">
+                {tasks.length === 0 && (
+                  <div className="text-center py-16 border border-dashed border-slate-800 rounded-2xl">
+                    <Brain className="w-12 h-12 text-slate-700 mx-auto mb-3" />
+                    <p className="text-slate-400 font-semibold">No tasks yet</p>
+                    <p className="text-slate-600 text-sm mt-1">Create a task to deploy the Cerebras agent</p>
+                    <button onClick={() => setShowCreate(true)}
+                      className="mt-6 bg-blue-600 hover:bg-blue-500 text-white text-sm font-bold px-6 py-2.5 rounded-xl transition">
+                      Create First Task
+                    </button>
                   </div>
                 )}
+                {tasks.map(task => (
+                  <div key={task.id} className={`p-5 rounded-2xl border ${statusBg(task.status)} transition group`}>
+                    <div className="flex items-start gap-4">
+                      <StatusIcon status={task.status} />
+                      <div className="flex-1 min-w-0">
+                        <div className="flex items-center gap-2 flex-wrap">
+                          <p className="font-bold text-white">{task.name}</p>
+                          <span className={`text-xs font-bold uppercase px-2 py-0.5 rounded-full ${statusColor(task.status)}`}>
+                            {task.status}
+                          </span>
+                          {task.schedule && (
+                            <span className="text-xs text-slate-500 bg-slate-800 px-2 py-0.5 rounded-full flex items-center gap-1">
+                              <Clock className="w-3 h-3" />{task.schedule}
+                            </span>
+                          )}
+                        </div>
+                        <p className="text-sm text-slate-400 mt-1 line-clamp-2">{task.prompt}</p>
+                        {task.last_run && <p className="text-xs text-slate-600 mt-1">Last run: {timeAgo(task.last_run)}</p>}
+                        {task.result && (
+                          <p className="text-xs text-slate-500 mt-1 bg-slate-800 rounded-lg px-3 py-1.5 line-clamp-2">
+                            {task.result.summary}
+                          </p>
+                        )}
+                      </div>
+                      <div className="flex gap-2">
+                        <button onClick={() => { setSelectedTask(task); setNav("logs"); }}
+                          className="p-2 rounded-xl text-slate-500 hover:text-blue-400 hover:bg-blue-900/20 transition" title="View logs">
+                          <Terminal className="w-4 h-4" />
+                        </button>
+                        <button onClick={() => runTask(task)} disabled={task.status === "running"}
+                          className="p-2 rounded-xl text-slate-500 hover:text-green-400 hover:bg-green-900/20 disabled:opacity-40 transition" title="Run now">
+                          <Play className="w-4 h-4" />
+                        </button>
+                        <button onClick={() => deleteTask(task)}
+                          className="p-2 rounded-xl text-slate-500 hover:text-red-400 hover:bg-red-900/20 transition" title="Delete">
+                          <Trash2 className="w-4 h-4" />
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+                ))}
               </motion.div>
             )}
 
-            {activeTab === "history" && (
-              <motion.div key="history" initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0 }} className="space-y-4">
-                <h2 className="text-xl font-bold text-white">Run History</h2>
-                <div className="bg-slate-900 border border-slate-800 rounded-2xl divide-y divide-slate-800 overflow-hidden">
-                  {tasks.filter(t => t.status === "completed" || t.status === "failed").length === 0 ? (
-                    <div className="p-12 text-center">
-                      <p className="text-slate-500 text-sm">No completed runs yet.</p>
+            {/* ── Logs ── */}
+            {nav === "logs" && (
+              <motion.div key="logs" initial={{ opacity: 0, y: 12 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0 }} className="space-y-4">
+                <div className="flex items-center gap-3">
+                  <select
+                    value={selectedTask?.id || ""}
+                    onChange={e => {
+                      const t = tasks.find(t => t.id === e.target.value) || null;
+                      setSelectedTask(t);
+                    }}
+                    className="bg-slate-800 border border-slate-700 rounded-xl px-4 py-2 text-sm text-white focus:outline-none focus:border-blue-500 transition"
+                  >
+                    <option value="">All tasks</option>
+                    {tasks.map(t => <option key={t.id} value={t.id}>{t.name}</option>)}
+                  </select>
+                  <button onClick={() => loadLogs(selectedTask?.id)}
+                    className="p-2 rounded-xl text-slate-500 hover:text-white hover:bg-slate-800 transition">
+                    <RefreshCw className="w-4 h-4" />
+                  </button>
+                  <span className="text-xs text-slate-500">{logs.length} entries</span>
+                </div>
+
+                <div className="bg-slate-950 border border-slate-800 rounded-2xl p-4 font-mono text-xs h-[calc(100vh-280px)] overflow-y-auto space-y-1">
+                  {logs.length === 0 ? (
+                    <p className="text-slate-600 text-center py-8">No logs yet. Run a task to see agent output.</p>
+                  ) : logs.map(log => (
+                    <div key={log.id} className="flex items-start gap-2 py-0.5">
+                      <span className="text-slate-600 flex-shrink-0">{new Date(log.created_at).toLocaleTimeString()}</span>
+                      <LogIcon type={log.log_type} />
+                      <span className={{
+                        info: "text-slate-300", success: "text-green-300",
+                        error: "text-red-300", warning: "text-amber-300"
+                      }[log.log_type]}>{log.message}</span>
                     </div>
-                  ) : (
-                    tasks.filter(t => ["completed", "failed"].includes(t.status)).map(task => (
-                      <div key={task.id} className="flex items-center gap-4 px-6 py-4">
-                        <StatusBadge status={task.status} />
-                        <div className="flex-1 min-w-0">
-                          <p className="text-sm font-semibold text-white">{task.name}</p>
-                          {task.result?.summary && <p className="text-xs text-slate-500 truncate mt-0.5">{task.result.summary}</p>}
-                        </div>
-                        <p className="text-xs text-slate-600">{formatDate(task.last_run)}</p>
-                        <button onClick={() => setSelectedTask(task)} className="text-xs text-blue-400 hover:text-blue-300 transition">View logs</button>
-                      </div>
-                    ))
-                  )}
+                  ))}
+                  <div ref={logsEndRef} />
                 </div>
               </motion.div>
             )}
 
-            {activeTab === "settings" && (
-              <motion.div key="settings" initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0 }}>
-                <SettingsTab />
+            {/* ── Settings ── */}
+            {nav === "settings" && (
+              <motion.div key="settings" initial={{ opacity: 0, y: 12 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0 }}>
+                <SettingsPage supabase={supabase} user={user} />
               </motion.div>
             )}
           </AnimatePresence>
-        </div>
-
-        {/* Status bar */}
-        <footer className="h-7 bg-[#020617] border-t border-slate-800 px-4 flex items-center justify-between shrink-0">
-          <div className="flex gap-4 items-center">
-            <span className="flex items-center gap-1.5 text-[10px] font-mono text-slate-600">
-              <span className="w-1.5 h-1.5 rounded-full bg-green-500" />
-              Supabase Connected
-            </span>
-            <span className="flex items-center gap-1.5 text-[10px] font-mono text-slate-600">
-              <span className="w-1.5 h-1.5 rounded-full bg-green-500" />
-              GitHub Actions Active
-            </span>
-          </div>
-          <span className="text-[10px] font-mono text-slate-700">v2.0.0 · AutoAgent Pro</span>
-        </footer>
+        </main>
       </div>
 
-      {showCreateModal && (
-        <CreateTaskModal onClose={() => setShowCreateModal(false)} onCreated={fetchTasks} />
-      )}
-      {selectedTask && (
-        <LogViewer task={selectedTask} onClose={() => setSelectedTask(null)} />
-      )}
+      {/* Create task modal */}
+      <AnimatePresence>
+        {showCreate && <CreateTaskModal onClose={() => setShowCreate(false)} onCreated={(t: Task) => { setTasks(p => [t, ...p]); setSelectedTask(t); }} supabase={supabase} user={user} />}
+      </AnimatePresence>
     </div>
   );
 }
