@@ -20,14 +20,15 @@ async def main():
         "Content-Type":  "application/json",
     }
 
+    # NOTE: 'name' removed — select only columns that exist
     async with httpx.AsyncClient(timeout=30) as client:
         res = await client.get(
-            f"{SUPABASE_URL}/rest/v1/tasks?status=eq.pending&select=id,name,prompt&order=created_at.asc",
+            f"{SUPABASE_URL}/rest/v1/tasks?status=eq.pending&select=id,prompt&order=created_at.asc",
             headers=headers,
         )
 
     if res.status_code != 200:
-        print(f"[ERROR] Supabase query failed: {res.status_code} {res.text[:200]}", flush=True)
+        print(f"[ERROR] Supabase query failed: {res.status_code} {res.text[:300]}", flush=True)
         sys.exit(1)
 
     tasks = res.json()
@@ -38,9 +39,10 @@ async def main():
         return
 
     for task in tasks:
-        tid  = task["id"]
-        name = task.get("name", "unnamed")
-        print(f"\n[AutoAgent] ▶ Starting task: {tid} — {name}", flush=True)
+        tid    = task["id"]
+        prompt = task.get("prompt", "")[:80]
+        print(f"\n[AutoAgent] ▶ Starting task: {tid}", flush=True)
+        print(f"[AutoAgent]   Prompt: {prompt}", flush=True)
         print("=" * 60, flush=True)
 
         proc = await asyncio.create_subprocess_exec(
@@ -50,8 +52,8 @@ async def main():
         )
         stdout, _ = await proc.communicate()
         output = stdout.decode(errors="replace")
-        # Print last 4000 chars to avoid log overflow
-        print(output[-4000:], flush=True)
+        # Print last 5000 chars to avoid log overflow
+        print(output[-5000:], flush=True)
         print(f"\n[AutoAgent] Task {tid} exit code: {proc.returncode}", flush=True)
         print("=" * 60, flush=True)
 

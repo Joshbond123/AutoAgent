@@ -99,7 +99,7 @@ function KeyPool({ keys, onAdd, onRemove, placeholder, label }: {
   );
 }
 
-export default function SettingsPage() {
+export default function SettingsPage({ onSettingsSaved }: { onSettingsSaved?: () => void } = {}) {
   const { supabase, user } = useSupabase();
   const [settings, setSettings] = useState<SettingsData>({
     cerebras_keys: [], nopecha_key: "",
@@ -147,7 +147,11 @@ export default function SettingsPage() {
     });
     if (error) setError(error.message);
     setSaving(false);
-    if (!error) { setSaved(true); setTimeout(() => setSaved(false), 2500); }
+    if (!error) {
+      setSaved(true);
+      setTimeout(() => setSaved(false), 2500);
+      onSettingsSaved?.();
+    }
   };
 
   const testCloudflare = async () => {
