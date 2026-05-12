@@ -70,6 +70,134 @@ except ImportError:
     ChatOpenAI = None
     print("[WARN] langchain-openai not installed", flush=True)
 
+
+# ── Custom Cerebras LLM with JSON-mode structured output ───────────────────────
+def make_cerebras_llm(api_key: str, model: str):
+    """
+    Build a LangChain-compatible LLM for Cerebras that overrides with_structured_output()
+    to use JSON-mode prompting instead of tool/function calling.
+
+    browser-use 0.1.40 calls:
+        llm.with_structured_output(AgentOutput, include_raw=True)
+
+    Cerebras models don't reliably produce the exact tool-call format LangChain expects,
+    causing an infinite "Step 1" loop.  This wrapper solves that by:
+      1. Converting the Pydantic schema to a JSON schema string
+      2. Injecting it as a system-level JSON-format instruction
+      3. Parsing the model's plain-JSON response into the Pydantic model
+      4. Returning it in the {"raw", "parsed", "parsing_error"} envelope browser-use needs
+    """
+    try:
+        from langchain_core.runnables import RunnableLambda
+        from langchain_core.messages import SystemMessage, AIMessage, BaseMessage
+        import pydantic
+    except ImportError as e:
+        print(f"[WARN] Cannot build Cerebras LLM wrapper: {e}", flush=True)
+        return None
+
+    # Prefer ChatCerebras (native), fall back to ChatOpenAI (compat)
+    if CEREBRAS_LANGCHAIN_OK and ChatCerebras is not None:
+        base_llm = ChatCerebras(
+            api_key=api_key,
+            model=model,
+            temperature=0.0,
+            max_tokens=8192,
+        )
+    elif LANGCHAIN_OK and ChatOpenAI is not None:
+        base_llm = ChatOpenAI(
+            base_url=CEREBRAS_BASE,
+            api_key=api_key,
+            model=model,
+            temperature=0.0,
+            max_tokens=8192,
+            timeout=120,
+            max_retries=2,
+        )
+    else:
+        return None
+
+    class _Wrapper:
+        """Thin wrapper around the base LLM that replaces with_structured_output."""
+
+        def __init__(self, llm):
+            self._llm = llm
+
+        # ── Forward everything the agent might call to the underlying LLM ──
+        def __getattr__(self, name):
+            return getattr(self._llm, name)
+
+        def with_structured_output(self, schema, *, include_raw: bool = False, **kwargs):
+            """
+            JSON-mode structured output.  Ignores tool/function-calling; instead:
+              - Adds the JSON schema as an instruction in the last system message (or inserts one)
+              - Calls the LLM with ainvoke
+              - Extracts and parses the JSON from the response
+              - Returns {"raw", "parsed", "parsing_error"} if include_raw else the parsed object
+            """
+            try:
+                if hasattr(schema, 'model_json_schema'):
+                    json_schema = json.dumps(schema.model_json_schema(), indent=2)
+                elif hasattr(schema, 'schema'):
+                    json_schema = json.dumps(schema.schema(), indent=2)
+                else:
+                    json_schema = str(schema)
+            except Exception:
+                json_schema = str(schema)
+
+            FORMAT_INSTRUCTION = (
+                "\n\n## IMPORTANT: Respond with ONLY a single valid JSON object.\n"
+                "No markdown, no code blocks, no explanation — raw JSON only.\n"
+                f"The JSON must conform to this schema:\n{json_schema}"
+            )
+
+            llm_ref = self._llm
+
+            async def _invoke(messages):
+                # Inject JSON instruction into the first human or system message
+                msgs = list(messages) if not isinstance(messages, list) else messages
+                injected = False
+                new_msgs = []
+                for m in msgs:
+                    if not injected and hasattr(m, "type") and m.type in ("system", "human"):
+                        content = m.content if isinstance(m.content, str) else str(m.content)
+                        new_msgs.append(type(m)(content=content + FORMAT_INSTRUCTION))
+                        injected = True
+                    else:
+                        new_msgs.append(m)
+                if not injected:
+                    new_msgs = [SystemMessage(content="You are a helpful AI." + FORMAT_INSTRUCTION)] + msgs
+
+                raw_response = await llm_ref.ainvoke(new_msgs)
+                content = raw_response.content if hasattr(raw_response, "content") else str(raw_response)
+
+                # Extract JSON from the response (handle markdown code blocks)
+                json_str = content.strip()
+                # Strip ```json ... ``` or ``` ... ```
+                json_str = re.sub(r'^```(?:json)?\s*', '', json_str)
+                json_str = re.sub(r'\s*```$', '', json_str)
+                json_str = json_str.strip()
+
+                parsed = None
+                parsing_error = None
+                try:
+                    data = json.loads(json_str)
+                    # Attempt to construct the Pydantic model
+                    if pydantic.VERSION.startswith("2."):
+                        parsed = schema.model_validate(data)
+                    else:
+                        parsed = schema(**data)
+                except Exception as e:
+                    parsing_error = str(e)
+                    print(f"[LLM] Structured output parse error: {e} | content[:200]={content[:200]}", flush=True)
+
+                if include_raw:
+                    return {"raw": raw_response, "parsed": parsed, "parsing_error": parsing_error}
+                return parsed
+
+            return RunnableLambda(_invoke)
+
+    return _Wrapper(base_llm)
+
 # ── Config ─────────────────────────────────────────────────────────────────────
 SUPABASE_URL     = os.environ.get("SUPABASE_URL", "")
 SUPABASE_SVC_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "")
@@ -305,34 +433,15 @@ async def run_browser_use_agent(
     if cerebras_pool and (CEREBRAS_LANGCHAIN_OK or LANGCHAIN_OK):
         key = cerebras_pool.next_key()
         if key:
-            # Try models in priority order — llama-3.3-70b FIRST (best tool-call support)
+            # Use the JSON-mode wrapper — bypasses tool-calling which Cerebras mishandles
             for model in CEREBRAS_MODELS:
                 try:
-                    if CEREBRAS_LANGCHAIN_OK and ChatCerebras is not None:
-                        # Preferred: langchain-cerebras ChatCerebras — natively handles
-                        # browser-use's with_structured_output() calls correctly.
-                        candidate = ChatCerebras(
-                            api_key=key,
-                            model=model,
-                            temperature=0.0,
-                            max_tokens=8192,
-                        )
-                        llm_label = f"Cerebras {model} (ChatCerebras)"
-                    else:
-                        # Fallback: OpenAI-compatible wrapper (may loop on Step 1)
-                        candidate = ChatOpenAI(
-                            base_url=CEREBRAS_BASE,
-                            api_key=key,
-                            model=model,
-                            temperature=0.0,
-                            max_tokens=8192,
-                            timeout=120,
-                            max_retries=2,
-                        )
-                        llm_label = f"Cerebras {model} (ChatOpenAI)"
-                    llm = candidate
-                    log(task_id, f"⚡ Cerebras LLM ready: {model}", "info", supabase)
-                    break
+                    candidate = make_cerebras_llm(api_key=key, model=model)
+                    if candidate is not None:
+                        llm = candidate
+                        llm_label = f"Cerebras {model} (JSON-mode)"
+                        log(task_id, f"⚡ Cerebras LLM ready: {model}", "info", supabase)
+                        break
                 except Exception as e:
                     print(f"[Cerebras] {model} init failed: {e}", flush=True)
                     continue
