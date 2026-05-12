@@ -316,6 +316,67 @@ ERRORS: {' | '.join(ctx.get('errors', []))}
 TASK: {prompt}{mem_str}"""
 
 
+# ── Bulletproof JSON Extractor ────────────────────────────────────────────────
+def extract_action_json(raw: str) -> Optional[dict]:
+    """
+    Extract a valid action JSON object from Cerebras output.
+    Handles: markdown code blocks, single quotes, trailing commas,
+             Python-style True/False/None, extra whitespace.
+    """
+    text = raw.strip()
+
+    # 1. Strip markdown code fences
+    text = re.sub(r'^```(?:json)?\s*', '', text, flags=re.MULTILINE)
+    text = re.sub(r'```\s*$', '', text, flags=re.MULTILINE)
+    text = text.strip()
+
+    # 2. Try to find JSON object boundaries
+    patterns = [
+        r'\{[^{}]*"action"\s*:[^{}]*\}',       # strict: action key inside {}
+        r'\{[^{}]*\}',                            # any {} block
+        r'\{.*?\}',                               # fallback: first {}
+    ]
+    candidates = []
+    for pat in patterns:
+        m = re.search(pat, text, re.DOTALL)
+        if m:
+            candidates.append(m.group())
+
+    # Also try the whole text if it looks like JSON
+    if text.startswith('{') and text.endswith('}'):
+        candidates.insert(0, text)
+
+    for raw_json in candidates:
+        # Fix common issues
+        fixed = raw_json
+        # Remove trailing commas before } or ]
+        fixed = re.sub(r',\s*([}\]])', r'\1', fixed)
+        # Replace single-quote strings with double quotes (simple cases)
+        fixed = re.sub(r"'([^']*)'", r'"\1"', fixed)
+        # Fix Python booleans/None
+        fixed = fixed.replace('True', 'true').replace('False', 'false').replace('None', 'null')
+        # Remove JS-style comments
+        fixed = re.sub(r'//[^\n]*', '', fixed)
+
+        try:
+            obj = json.loads(fixed)
+            if isinstance(obj, dict) and 'action' in obj:
+                return obj
+        except Exception:
+            pass
+
+    # Last resort: look for action keyword and build minimal JSON
+    action_m = re.search(r'"action"\s*:\s*"(\w+)"', text)
+    if action_m:
+        reason_m = re.search(r'"reason"\s*:\s*"([^"]*)"', text)
+        return {
+            "action": action_m.group(1).upper(),
+            "reason": reason_m.group(1) if reason_m else "AI decision (JSON repaired)",
+        }
+
+    return None
+
+
 # ── Main Playwright Agent ─────────────────────────────────────────────────────
 async def run_agent(task_id: str, prompt: str, pool: Optional[CerebrasPool],
                     supabase=None) -> dict:
@@ -388,6 +449,9 @@ async def run_agent(task_id: str, prompt: str, pool: Optional[CerebrasPool],
         await upload_screenshot(page, task_id, 0, "Initial page load", supabase)
 
         # ── Agent Loop ───────────────────────────────────────────────────────
+        recent_actions: List[str] = []   # loop detection buffer
+        consecutive_waits = 0
+
         while steps_done < max_steps:
             steps_done += 1
             current_url = page.url
@@ -400,6 +464,21 @@ async def run_agent(task_id: str, prompt: str, pool: Optional[CerebrasPool],
             # Check CAPTCHA each step
             await handle_captcha(page, task_id, supabase, NOPECHA_KEY)
 
+            # ── Loop Detection ────────────────────────────────────────────────
+            # If last 4 actions were identical, force a FINISH with what we have
+            if len(recent_actions) >= 4 and len(set(recent_actions[-4:])) == 1:
+                loop_summary = f"Loop detected — agent repeated same action 4x. Memory: {' | '.join(memory)}"
+                log(task_id, f"⚠️ Loop detected — forcing completion", "warning", supabase)
+                final_summary = loop_summary
+                await upload_screenshot(page, task_id, steps_done, "Loop detected - stopping", supabase)
+                break
+
+            # If consecutive WAITs > 5, something is wrong — break
+            if consecutive_waits >= 5:
+                log(task_id, "⚠️ Too many WAITs — forcing completion with collected data", "warning", supabase)
+                final_summary = f"Partial completion after {steps_done} steps. Memory: {' | '.join(memory)}"
+                break
+
             # Build page context
             page_ctx = await get_page_context(page, prompt, memory)
 
@@ -407,26 +486,32 @@ async def run_agent(task_id: str, prompt: str, pool: Optional[CerebrasPool],
             action: Optional[dict] = None
             if pool:
                 try:
-                    system_prompt = """You are AutoAgent Pro, an autonomous web browsing AI.
-Analyze the current page and decide the SINGLE best next action to complete the task.
+                    # Build loop-awareness hint
+                    loop_hint = ""
+                    if consecutive_waits >= 2:
+                        loop_hint = f"\n⚠️ IMPORTANT: Last {consecutive_waits} responses had JSON errors. You MUST output ONLY a raw JSON object starting with {{ and ending with }}. No text before or after."
+                    if len(recent_actions) >= 3 and len(set(recent_actions[-3:])) == 1:
+                        loop_hint += f"\n⚠️ IMPORTANT: You have repeated the same action {len(recent_actions[-3:])}x in a row. Try a DIFFERENT action type."
 
-AVAILABLE ACTIONS:
-- GOTO     → navigate to a URL: {"action":"GOTO","url":"https://...","reason":"why"}
-- CLICK    → click an element: {"action":"CLICK","selector":"CSS_SELECTOR","reason":"why"}
-- TYPE     → fill an input: {"action":"TYPE","selector":"CSS_SELECTOR","text":"value","reason":"why"}
-- PRESS_KEY→ press keyboard key: {"action":"PRESS_KEY","key":"Enter","reason":"why"}
-- SCROLL   → scroll page: {"action":"SCROLL","scrollY":400,"reason":"why"}
-- EXTRACT  → extract text via JS: {"action":"EXTRACT","js":"document.querySelector('h1').innerText","label":"page title","reason":"why"}
-- WAIT     → wait for load: {"action":"WAIT","ms":2000,"reason":"why"}
-- FINISH   → task complete: {"action":"FINISH","summary":"Full extracted data summary here","reason":"done"}
+                    system_prompt = f"""You are AutoAgent Pro, an autonomous web browsing AI.
+Output ONLY a single JSON object. No markdown. No explanation. Just the JSON.
 
-RULES:
-1. Return ONLY valid JSON — no explanation, no markdown
-2. Use EXTRACT to read data from the page, not CLICK
-3. Use FINISH when all required data is extracted or task is complete
-4. Be precise with CSS selectors — prefer id, name, or aria-label attributes
-5. After typing in a search box, use PRESS_KEY Enter to submit
-6. If page shows error or is stuck for 3+ steps, use GOTO to navigate away"""
+ACTIONS (pick ONE):
+{{"action":"GOTO","url":"https://example.com","reason":"why"}}
+{{"action":"CLICK","selector":"a.link","reason":"why"}}
+{{"action":"TYPE","selector":"#search","text":"query","reason":"why"}}
+{{"action":"PRESS_KEY","key":"Enter","reason":"why"}}
+{{"action":"SCROLL","scrollY":500,"reason":"why"}}
+{{"action":"EXTRACT","js":"document.querySelector('h1').innerText","label":"title","reason":"why"}}
+{{"action":"WAIT","ms":2000,"reason":"why"}}
+{{"action":"FINISH","summary":"all extracted data here","reason":"done"}}
+
+CRITICAL RULES:
+- Output ONLY valid JSON starting with {{ ending with }}
+- Use double quotes for all strings
+- Use EXTRACT to read page content (not CLICK)
+- Use FINISH when data is extracted or task complete
+- Do NOT repeat an action you just did unless URL changed{loop_hint}"""
 
                     response = await cerebras_chat(
                         pool,
@@ -435,18 +520,8 @@ RULES:
                         max_tokens=400,
                     )
 
-                    # Extract JSON from response
-                    json_match = re.search(r'\{[^{}]*"action"[^{}]*\}', response, re.DOTALL)
-                    if json_match:
-                        action = json.loads(json_match.group())
-                    else:
-                        # Try to find any JSON object
-                        json_match2 = re.search(r'\{.*?\}', response, re.DOTALL)
-                        if json_match2:
-                            try:
-                                action = json.loads(json_match2.group())
-                            except Exception:
-                                pass
+                    # ── Bulletproof JSON extraction ────────────────────────
+                    action = extract_action_json(response)
 
                 except Exception as e:
                     log(task_id, f"⚠️ AI error: {str(e)[:100]}", "warning", supabase)
@@ -457,6 +532,13 @@ RULES:
             action_type = action.get("action", "WAIT").upper()
             reason      = action.get("reason", "")
             log(task_id, f"🤖 {action_type}: {reason[:120]}", "info", supabase)
+
+            # Track for loop detection
+            action_key = action_type + ":" + str(action.get("url", action.get("selector", "")))[:50]
+            recent_actions.append(action_key)
+            if len(recent_actions) > 8:
+                recent_actions.pop(0)
+            consecutive_waits = consecutive_waits + 1 if action_type == "WAIT" else 0
 
             # ── Execute Action ────────────────────────────────────────────────
             if action_type == "FINISH":
