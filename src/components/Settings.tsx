@@ -591,7 +591,7 @@ export default function SettingsPage({ onSettingsSaved }: { onSettingsSaved?: ()
                     <span className="text-purple-400">⚡</span> Cerebras AI Key Pool
                   </h3>
                   <p className="text-xs text-slate-500 mt-1">
-                    Primary AI for browser decision making · Models: gpt-oss-120b, qwen-3-235b, llama3.1-8b
+                    Primary AI for browser decision making · Models: llama-3.3-70b, llama3.1-8b
                   </p>
                   <p className="text-xs text-slate-500">Keys rotate automatically to avoid rate limits.</p>
                 </div>
@@ -692,7 +692,7 @@ export default function SettingsPage({ onSettingsSaved }: { onSettingsSaved?: ()
                     label:  "Cerebras AI",
                     ok:     cerebrasKeys.length > 0,
                     detail: cerebrasKeys.length > 0
-                      ? `${cerebrasKeys.length} key(s) · gpt-oss-120b, qwen-3-235b, llama3.1-8b`
+                      ? `${cerebrasKeys.length} key(s) · llama-3.3-70b, llama3.1-8b`
                       : "No keys — add at least one key",
                   },
                   {

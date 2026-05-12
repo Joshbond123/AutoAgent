@@ -1,194 +1,335 @@
 #!/usr/bin/env python3
 """
-AutoAgent Pro — Browser-Use Worker v6
-Uses the browser-use library for AI-controlled browser automation.
-Primary LLM:  Cerebras via langchain-cerebras (ChatCerebras — native structured-output support)
-Fallback LLM: Cloudflare Workers AI text model
-Browser:      browser-use (built on Playwright, stealth, headless)
-Screenshots:  Streamed to Supabase task_logs in real-time
+AutoAgent Pro — Browser-Use Worker v7
+==============================================
+Primary LLM  : Cerebras via OpenAI-compatible API (ChatOpenAI with base_url)
+               OR langchain-cerebras (ChatCerebras) if available
+Fallback LLM : Cloudflare Workers AI text model
+Browser      : browser-use (Playwright, stealth, headless)
+Screenshots  : Streamed to Supabase task_logs in real-time
+Streaming    : Step-level callbacks log every agent action to Supabase
+
+Integration references:
+  https://inference-docs.cerebras.ai/integrations/browser-use
+  https://inference-docs.cerebras.ai/capabilities/tool-use
+  https://docs.browser-use.com/open-source/supported-models
 """
 
-import asyncio, os, sys, json, base64, time, random, re, traceback
+import asyncio, os, sys, json, base64, re, traceback
 from datetime import datetime
 from typing import Optional, List, Any
 import urllib.request as _ur
 
-# ── Optional deps ──────────────────────────────────────────────────────────────
-try:
-    import httpx
-    HTTPX_OK = True
-except ImportError:
-    HTTPX_OK = False
-    print("[WARN] httpx not installed", flush=True)
+# ─────────────────────────────────────────────────────────────────────────────
+# Constants
+# ─────────────────────────────────────────────────────────────────────────────
+CEREBRAS_BASE    = "https://api.cerebras.ai/v1"
+SCREENSHOT_EVERY = 2  # capture a screenshot every N agent steps
 
+# Model priority — llama-3.3-70b has the best structured-output support
+CEREBRAS_MODELS = [
+    "llama-3.3-70b",
+    "llama3.1-8b",
+]
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Environment
+# ─────────────────────────────────────────────────────────────────────────────
+SUPABASE_URL      = os.environ.get("SUPABASE_URL", "")
+SUPABASE_SVC_KEY  = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "")
+NOPECHA_KEY       = os.environ.get("NOPECHA_API_KEY", "")
+CF_ACCOUNT_ID_ENV = os.environ.get("CLOUDFLARE_ACCOUNT_ID", "")
+CF_API_KEY_ENV    = os.environ.get("CLOUDFLARE_API_KEY", "")
+CF_MODEL_ENV      = os.environ.get("CLOUDFLARE_MODEL", "@cf/meta/llama-3.3-70b-instruct-fp8-fast")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Optional dependency imports
+# ─────────────────────────────────────────────────────────────────────────────
 try:
     from supabase import create_client
     SUPABASE_AVAILABLE = True
 except ImportError:
     SUPABASE_AVAILABLE = False
-    print("[WARN] supabase not installed — logs will go to stdout only", flush=True)
+    print("[WARN] supabase-py not installed — logs go to stdout only", flush=True)
+
+# browser-use import (version-agnostic)
+BROWSER_USE_OK       = False
+Agent                = None
+Browser              = None
+BrowserConfig        = None
+BrowserContextConfig = None
 
 try:
     from browser_use import Agent
-    # Browser/BrowserConfig location varies by version
     try:
         from browser_use import Browser, BrowserConfig
     except ImportError:
         try:
             from browser_use.browser.browser import Browser, BrowserConfig
         except ImportError:
-            Browser = None
-            BrowserConfig = None
-    # BrowserContextConfig may not exist in all versions
+            pass
     try:
         from browser_use.browser.context import BrowserContextConfig
     except ImportError:
-        BrowserContextConfig = None
+        pass
     BROWSER_USE_OK = True
+    print(f"[OK] browser-use imported (Agent={Agent is not None})", flush=True)
 except ImportError as _e:
-    BROWSER_USE_OK = False
-    Agent = None
-    Browser = None
-    BrowserConfig = None
-    BrowserContextConfig = None
     print(f"[ERROR] browser-use not installed: {_e}", flush=True)
-    print("[ERROR] Run: pip install browser-use==0.1.40 langchain-openai", flush=True)
 
-try:
-    from langchain_cerebras import ChatCerebras
-    CEREBRAS_LANGCHAIN_OK = True
-except ImportError:
-    CEREBRAS_LANGCHAIN_OK = False
-    ChatCerebras = None
-    print("[WARN] langchain-cerebras not installed — falling back to langchain-openai", flush=True)
-
+# LangChain OpenAI — required for Cerebras OpenAI-compat integration
+LANGCHAIN_OK = False
+ChatOpenAI   = None
 try:
     from langchain_openai import ChatOpenAI
     LANGCHAIN_OK = True
+    print("[OK] langchain-openai imported", flush=True)
 except ImportError:
-    LANGCHAIN_OK = False
-    ChatOpenAI = None
     print("[WARN] langchain-openai not installed", flush=True)
 
+# LangChain Cerebras native (optional — used if available)
+CEREBRAS_LANGCHAIN_OK = False
+ChatCerebras          = None
+try:
+    from langchain_cerebras import ChatCerebras
+    CEREBRAS_LANGCHAIN_OK = True
+    print("[OK] langchain-cerebras imported", flush=True)
+except ImportError:
+    print("[WARN] langchain-cerebras not installed — using ChatOpenAI compat mode", flush=True)
 
-# ── Custom Cerebras LLM with JSON-mode structured output ───────────────────────
-def make_cerebras_llm(api_key: str, model: str):
+# LangChain core helpers
+LANGCHAIN_CORE_OK = False
+try:
+    from langchain_core.runnables import RunnableLambda
+    from langchain_core.messages import SystemMessage, AIMessage, BaseMessage
+    from langchain_core.language_models.chat_models import BaseChatModel
+    from langchain_core.outputs import ChatGeneration, ChatResult
+    import pydantic as _pydantic
+    LANGCHAIN_CORE_OK = True
+except ImportError as e:
+    print(f"[WARN] langchain-core not available: {e}", flush=True)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# JSON extraction utility
+# ─────────────────────────────────────────────────────────────────────────────
+def _extract_json(text: str) -> str:
     """
-    Build a LangChain-compatible LLM for Cerebras that overrides with_structured_output()
-    to use JSON-mode prompting instead of tool/function calling.
+    Robustly extract a JSON object from an LLM response.
+    Handles: markdown fences, surrounding prose, nested objects.
+    """
+    text = text.strip()
 
-    browser-use 0.1.40 calls:
+    # Strip markdown fences first
+    fenced = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", text)
+    if fenced:
+        candidate = fenced.group(1).strip()
+        if candidate.startswith("{"):
+            return candidate
+
+    # Find outermost { ... } using a state machine (handles nested objects)
+    start = text.find("{")
+    if start == -1:
+        return text
+
+    depth  = 0
+    in_str = False
+    esc    = False
+    for i, ch in enumerate(text[start:], start):
+        if esc:
+            esc = False
+            continue
+        if ch == "\\" and in_str:
+            esc = True
+            continue
+        if ch == '"':
+            in_str = not in_str
+            continue
+        if in_str:
+            continue
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start : i + 1]
+
+    return text[start:]  # unbalanced — best effort
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Structured-output override factory
+# ─────────────────────────────────────────────────────────────────────────────
+def _make_wso_override():
+    """
+    Build a `with_structured_output` method suitable for any LangChain chat
+    model subclass.
+
+    browser-use calls:
         llm.with_structured_output(AgentOutput, include_raw=True)
 
-    Cerebras models don't reliably produce the exact tool-call format LangChain expects,
-    causing an infinite "Step 1" loop.  This wrapper solves that by:
-      1. Converting the Pydantic schema to a JSON schema string
-      2. Injecting it as a system-level JSON-format instruction
-      3. Parsing the model's plain-JSON response into the Pydantic model
-      4. Returning it in the {"raw", "parsed", "parsing_error"} envelope browser-use needs
+    Cerebras models don't always produce the exact tool-call envelope that
+    LangChain's default `with_structured_output` expects, which causes the
+    agent to loop on Step 1 indefinitely.
+
+    This replacement:
+      1. Converts the Pydantic schema → JSON schema string
+      2. Injects a strict formatting instruction into the system message
+      3. Invokes the underlying LLM via ainvoke()
+      4. Extracts and parses the JSON reply → Pydantic model
+      5. Returns { "raw", "parsed", "parsing_error" } envelope (browser-use
+         requires this shape when include_raw=True)
     """
-    try:
-        from langchain_core.runnables import RunnableLambda
-        from langchain_core.messages import SystemMessage
-        import pydantic as _pydantic
-    except ImportError as e:
-        print(f"[WARN] Cannot build Cerebras LLM wrapper: {e}", flush=True)
+    if not LANGCHAIN_CORE_OK:
         return None
 
-    def _make_wso_method(get_self):
-        """Create a with_structured_output method that captures the self reference lazily."""
-        def _wso(self_ref, schema, *, include_raw: bool = False, **kwargs):
-            try:
-                if hasattr(schema, 'model_json_schema'):
-                    json_schema = json.dumps(schema.model_json_schema(), indent=2)
-                elif hasattr(schema, 'schema'):
-                    json_schema = json.dumps(schema.schema(), indent=2)
-                else:
-                    json_schema = str(schema)
-            except Exception:
-                json_schema = str(schema)
+    def with_structured_output(self_ref, schema, *, include_raw: bool = False, **kwargs):
+        # Build JSON schema string
+        try:
+            if hasattr(schema, "model_json_schema"):
+                json_schema_str = json.dumps(schema.model_json_schema(), indent=2)
+            elif hasattr(schema, "schema"):
+                json_schema_str = json.dumps(schema.schema(), indent=2)
+            else:
+                json_schema_str = str(schema)
+        except Exception:
+            json_schema_str = str(schema)
 
-            FORMAT_INSTRUCTION = (
-                "\n\n## CRITICAL INSTRUCTION: Your entire response must be a single valid JSON object.\n"
-                "Do NOT include any markdown, code fences, explanation, or extra text.\n"
-                "Output ONLY the JSON object (starting with { and ending with }).\n"
-                "The JSON must conform to this schema:\n"
-                f"{json_schema}"
+        FORMAT_INSTRUCTION = (
+            "\n\n"
+            "## CRITICAL OUTPUT FORMAT\n"
+            "Your ENTIRE response MUST be a single valid JSON object.\n"
+            "Do NOT include markdown fences, comments, or any text outside the JSON.\n"
+            "Start with `{` and end with `}`. No prose before or after.\n"
+            "Omit optional fields you don't need rather than setting them to null.\n"
+            "The JSON must conform to this schema:\n"
+            f"{json_schema_str}"
+        )
+
+        llm_ref = self_ref
+
+        async def _invoke(messages):
+            # Normalise input — browser-use passes list[BaseMessage] or PromptValue
+            try:
+                if hasattr(messages, "to_messages"):
+                    msgs = list(messages.to_messages())
+                elif isinstance(messages, (list, tuple)):
+                    msgs = list(messages)
+                else:
+                    msgs = [messages]
+            except Exception:
+                msgs = list(messages) if messages else []
+
+            # Inject format instruction into the system message
+            new_msgs  = []
+            injected  = False
+            for m in msgs:
+                if not injected and hasattr(m, "type") and m.type == "system":
+                    content = m.content if isinstance(m.content, str) else str(m.content)
+                    new_msgs.append(SystemMessage(content=content + FORMAT_INSTRUCTION))
+                    injected = True
+                else:
+                    new_msgs.append(m)
+            if not injected:
+                new_msgs = [
+                    SystemMessage(content="You are a browser automation AI agent." + FORMAT_INSTRUCTION)
+                ] + msgs
+
+            # Call the underlying LLM
+            try:
+                raw_response = await llm_ref.ainvoke(new_msgs)
+            except Exception as e:
+                print(f"[LLM] ainvoke error: {e!r}", flush=True)
+                raw_response = AIMessage(content="{}")
+
+            content = (
+                raw_response.content
+                if hasattr(raw_response, "content")
+                else str(raw_response)
             )
 
-            llm_ref = self_ref
+            # Extract and parse JSON
+            json_str      = _extract_json(content)
+            parsed        = None
+            parsing_error = None
 
-            async def _invoke(messages):
-                msgs = list(messages) if not isinstance(messages, list) else messages
-                injected = False
-                new_msgs = []
-                for m in msgs:
-                    if not injected and hasattr(m, "type") and m.type == "system":
-                        content = m.content if isinstance(m.content, str) else str(m.content)
-                        new_msgs.append(type(m)(content=content + FORMAT_INSTRUCTION))
-                        injected = True
-                    else:
-                        new_msgs.append(m)
-                if not injected:
-                    new_msgs = [SystemMessage(content="You are a browser automation AI." + FORMAT_INSTRUCTION)] + msgs
+            try:
+                data = json.loads(json_str)
+                if hasattr(_pydantic, "VERSION") and _pydantic.VERSION.startswith("2."):
+                    parsed = schema.model_validate(data)
+                else:
+                    parsed = schema(**data)
+            except Exception as e:
+                parsing_error = str(e)
+                print(
+                    f"[LLM] JSON parse error: {e!r} | "
+                    f"raw_len={len(content)} | "
+                    f"extracted_start={json_str[:200]!r}",
+                    flush=True,
+                )
 
-                raw_response = await llm_ref.ainvoke(new_msgs)
-                content = raw_response.content if hasattr(raw_response, "content") else str(raw_response)
+            if include_raw:
+                return {"raw": raw_response, "parsed": parsed, "parsing_error": parsing_error}
+            return parsed
 
-                json_str = content.strip()
-                json_str = re.sub(r'^```(?:json)?\s*', '', json_str, flags=re.MULTILINE)
-                json_str = re.sub(r'\s*```\s*$', '', json_str, flags=re.MULTILINE)
-                json_str = json_str.strip()
+        return RunnableLambda(_invoke)
 
-                parsed = None
-                parsing_error = None
-                try:
-                    data = json.loads(json_str)
-                    if _pydantic.VERSION.startswith("2."):
-                        parsed = schema.model_validate(data)
-                    else:
-                        parsed = schema(**data)
-                except Exception as e:
-                    parsing_error = str(e)
-                    print(f"[LLM] JSON parse error: {e!r} | raw_len={len(content)} | start={content[:200]!r}", flush=True)
+    return with_structured_output
 
-                if include_raw:
-                    return {"raw": raw_response, "parsed": parsed, "parsing_error": parsing_error}
-                return parsed
 
-            return RunnableLambda(_invoke)
-        return _wso
+# ─────────────────────────────────────────────────────────────────────────────
+# Cerebras LLM builder
+# ─────────────────────────────────────────────────────────────────────────────
+def make_cerebras_llm(api_key: str, model: str):
+    """
+    Build a LangChain-compatible LLM for Cerebras with JSON-mode structured
+    output (required by browser-use).
 
-    # ── Subclass ChatCerebras (preferred: it's a proper BaseChatModel) ─────────
+    Strategy order:
+      1. langchain-cerebras ChatCerebras subclass (native — preferred)
+      2. langchain-openai ChatOpenAI subclass with Cerebras base_url
+         (official OpenAI-compat approach from Cerebras docs)
+    """
+    if not LANGCHAIN_CORE_OK:
+        print("[Cerebras] langchain-core not available", flush=True)
+        return None
+
+    wso = _make_wso_override()
+    if wso is None:
+        return None
+
+    # Strategy 1 — native langchain-cerebras
     if CEREBRAS_LANGCHAIN_OK and ChatCerebras is not None:
         try:
-            _wso_fn = _make_wso_method(None)
-
             class _CerebrasJSONMode(ChatCerebras):
-                """ChatCerebras subclass — overrides with_structured_output for JSON mode."""
+                """ChatCerebras with JSON-mode structured output override."""
                 def with_structured_output(self, schema, *, include_raw=False, **kwargs):
-                    return _wso_fn(self, schema, include_raw=include_raw, **kwargs)
+                    return wso(self, schema, include_raw=include_raw, **kwargs)
 
-            return _CerebrasJSONMode(
+            llm = _CerebrasJSONMode(
                 api_key=api_key,
                 model=model,
                 temperature=0.0,
                 max_tokens=8192,
             )
+            print(f"[Cerebras] ChatCerebras (JSON-mode) ready: {model}", flush=True)
+            return llm
         except Exception as e:
-            print(f"[Cerebras] ChatCerebras subclass failed: {e}", flush=True)
+            print(f"[Cerebras] ChatCerebras init failed: {e} — trying OpenAI compat", flush=True)
 
-    # ── Fallback: ChatOpenAI subclass (Cerebras-compatible base_url) ───────────
+    # Strategy 2 — OpenAI-compatible (official Cerebras docs approach)
     if LANGCHAIN_OK and ChatOpenAI is not None:
         try:
-            _wso_fn = _make_wso_method(None)
-
-            class _OpenAIJSONMode(ChatOpenAI):
-                """ChatOpenAI subclass (Cerebras backend) — JSON-mode structured output."""
+            class _CerebrasOpenAICompat(ChatOpenAI):
+                """
+                ChatOpenAI pointed at Cerebras API with JSON-mode structured
+                output override.
+                Ref: https://inference-docs.cerebras.ai/integrations/browser-use
+                """
                 def with_structured_output(self, schema, *, include_raw=False, **kwargs):
-                    return _wso_fn(self, schema, include_raw=include_raw, **kwargs)
+                    return wso(self, schema, include_raw=include_raw, **kwargs)
 
-            return _OpenAIJSONMode(
+            llm = _CerebrasOpenAICompat(
                 base_url=CEREBRAS_BASE,
                 api_key=api_key,
                 model=model,
@@ -197,33 +338,130 @@ def make_cerebras_llm(api_key: str, model: str):
                 timeout=120,
                 max_retries=2,
             )
+            print(f"[Cerebras] ChatOpenAI-compat (JSON-mode) ready: {model}", flush=True)
+            return llm
         except Exception as e:
-            print(f"[Cerebras] OpenAI fallback subclass failed: {e}", flush=True)
+            print(f"[Cerebras] ChatOpenAI-compat init failed: {e}", flush=True)
 
     return None
 
-# ── Config ─────────────────────────────────────────────────────────────────────
-SUPABASE_URL     = os.environ.get("SUPABASE_URL", "")
-SUPABASE_SVC_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "")
-NOPECHA_KEY      = os.environ.get("NOPECHA_API_KEY", "")
-CEREBRAS_BASE    = "https://api.cerebras.ai/v1"
 
-# llama-3.3-70b first — it has the best structured-output / tool-call support
-CEREBRAS_MODELS = [
-    "llama-3.3-70b",
-    "llama3.1-8b",
-]
+# ─────────────────────────────────────────────────────────────────────────────
+# Cloudflare LLM builder
+# ─────────────────────────────────────────────────────────────────────────────
+def _cf_text_sync(account_id: str, api_key: str, model: str, messages: list) -> str:
+    """Synchronous Cloudflare Workers AI text call."""
+    url  = f"https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/run/{model}"
+    body = json.dumps({"messages": messages}).encode()
+    req  = _ur.Request(url, data=body, method="POST", headers={
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type":  "application/json",
+    })
+    try:
+        with _ur.urlopen(req, timeout=60) as r:
+            data    = json.loads(r.read())
+        result  = data.get("result", {}) or {}
+        choices = result.get("choices") or []
+        if choices:
+            return choices[0].get("message", {}).get("content", "") or ""
+        return result.get("response", "") or ""
+    except Exception as e:
+        print(f"[Cloudflare] text error: {e}", flush=True)
+        return ""
 
-CF_ACCOUNT_ID_ENV = os.environ.get("CLOUDFLARE_ACCOUNT_ID", "")
-CF_API_KEY_ENV    = os.environ.get("CLOUDFLARE_API_KEY", "")
-CF_MODEL_ENV      = os.environ.get("CLOUDFLARE_MODEL", "@cf/meta/llama-3.3-70b-instruct-fp8-fast")
 
-SCREENSHOT_EVERY = 2  # capture a screenshot every N steps
+def make_cloudflare_llm(account_id: str, api_key: str, model: str):
+    """
+    Wrap Cloudflare Workers AI as a LangChain BaseChatModel.
+    Includes the JSON-mode structured output override so browser-use can use it.
+    """
+    if not LANGCHAIN_CORE_OK:
+        return None
+
+    wso = _make_wso_override()
+    if wso is None:
+        return None
+
+    try:
+        class CloudflareChatModel(BaseChatModel):
+            account_id: str
+            api_key: str
+            model: str
+
+            @property
+            def _llm_type(self) -> str:
+                return "cloudflare"
+
+            def _generate(
+                self,
+                messages: List[BaseMessage],
+                stop=None,
+                run_manager=None,
+                **kwargs,
+            ) -> "ChatResult":
+                lc_msgs = []
+                for m in messages:
+                    mtype = getattr(m, "type", "human")
+                    role  = (
+                        "system"    if mtype == "system"
+                        else "user" if mtype == "human"
+                        else "assistant"
+                    )
+                    lc_msgs.append({"role": role, "content": str(m.content)})
+
+                reply = _cf_text_sync(self.account_id, self.api_key, self.model, lc_msgs)
+                gen   = ChatGeneration(
+                    message=AIMessage(content=reply or "Unable to process this request.")
+                )
+                return ChatResult(generations=[gen])
+
+            def with_structured_output(self, schema, *, include_raw=False, **kwargs):
+                return wso(self, schema, include_raw=include_raw, **kwargs)
+
+        llm = CloudflareChatModel(account_id=account_id, api_key=api_key, model=model)
+        print(f"[Cloudflare] LLM ready: {model}", flush=True)
+        return llm
+    except Exception as e:
+        print(f"[Cloudflare] LLM wrapper error: {e}", flush=True)
+        return None
 
 
-# ── Supabase logging ───────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# Cerebras key pool
+# ─────────────────────────────────────────────────────────────────────────────
+class CerebrasPool:
+    def __init__(self, keys: List[str]):
+        self.keys   = [k.strip() for k in keys if k.strip()]
+        self.idx    = 0
+        self.failed: set = set()
+
+    def next_key(self) -> Optional[str]:
+        avail = [k for k in self.keys if k not in self.failed]
+        if not avail:
+            self.failed.clear()
+            avail = self.keys
+        if not avail:
+            return None
+        key      = avail[self.idx % len(avail)]
+        self.idx = (self.idx + 1) % max(len(avail), 1)
+        return key
+
+    def mark_failed(self, key: str):
+        self.failed.add(key)
+
+    @property
+    def size(self):
+        return len(self.keys)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Supabase logging helpers
+# ─────────────────────────────────────────────────────────────────────────────
 def log(task_id: str, message: str, log_type: str = "info", supabase=None):
-    icons = {"info": "ℹ", "success": "✓", "error": "✗", "warning": "⚠", "screenshot": "📸"}
+    icons = {
+        "info": "ℹ", "success": "✓", "error": "✗",
+        "warning": "⚠", "screenshot": "📸",
+    }
     print(f"{icons.get(log_type, 'ℹ')} [{log_type.upper()}] {message[:300]}", flush=True)
     if supabase and task_id:
         try:
@@ -238,7 +476,12 @@ def log(task_id: str, message: str, log_type: str = "info", supabase=None):
 
 
 def log_screenshot(task_id: str, b64: str, label: str, supabase=None):
-    """Store a base64 screenshot in task_logs via direct REST (bypasses supabase-py size limits)."""
+    """
+    Store a base64 screenshot in task_logs via direct REST call.
+    (supabase-py has size limits that prevent storing large payloads inline.)
+    """
+    if not b64:
+        return
     size_kb = len(b64) // 1024
     print(f"📸 Screenshot ({size_kb}KB): {label}", flush=True)
     if not (SUPABASE_URL and SUPABASE_SVC_KEY and task_id):
@@ -252,15 +495,16 @@ def log_screenshot(task_id: str, b64: str, label: str, supabase=None):
         }).encode("utf-8")
         req = _ur.Request(
             f"{SUPABASE_URL}/rest/v1/task_logs",
-            data=payload, method="POST",
+            data=payload,
+            method="POST",
             headers={
                 "Authorization": f"Bearer {SUPABASE_SVC_KEY}",
                 "apikey":        SUPABASE_SVC_KEY,
                 "Content-Type":  "application/json",
                 "Prefer":        "return=minimal",
-            }
+            },
         )
-        with _ur.urlopen(req, timeout=20) as r:
+        with _ur.urlopen(req, timeout=25) as r:
             print(f"[Screenshot] Stored {size_kb}KB — HTTP {r.status}", flush=True)
     except Exception as e:
         print(f"[WARN] screenshot store failed: {e}", flush=True)
@@ -279,142 +523,60 @@ def update_task_status(task_id: str, status: str, result: dict = None, supabase=
         print(f"[WARN] status update: {e}", flush=True)
 
 
-# ── Cerebras key pool ──────────────────────────────────────────────────────────
-class CerebrasPool:
-    def __init__(self, keys: List[str]):
-        self.keys   = [k.strip() for k in keys if k.strip()]
-        self.idx    = 0
-        self.failed: set = set()
-
-    def next_key(self) -> Optional[str]:
-        avail = [k for k in self.keys if k not in self.failed]
-        if not avail:
-            self.failed.clear()
-            avail = self.keys
-        if not avail:
-            return None
-        key = avail[self.idx % len(avail)]
-        self.idx = (self.idx + 1) % len(avail)
-        return key
-
-    def mark_failed(self, key: str):
-        self.failed.add(key)
-
-    @property
-    def size(self): return len(self.keys)
-
-
-def pick_cerebras_llm(pool: CerebrasPool, model: str = "llama3.1-8b") -> Optional[Any]:
-    """Build a LangChain ChatOpenAI pointed at the Cerebras API."""
-    if not LANGCHAIN_OK:
-        return None
-    key = pool.next_key()
-    if not key:
-        return None
+# ─────────────────────────────────────────────────────────────────────────────
+# Screenshot capture helper
+# ─────────────────────────────────────────────────────────────────────────────
+async def capture_screenshot(
+    browser_obj, task_id: str, step: int, label: str, supabase=None
+) -> Optional[str]:
+    """
+    Capture a JPEG screenshot from the active browser page.
+    Tries multiple browser-use API shapes (version-agnostic).
+    """
     try:
-        return ChatOpenAI(
-            base_url=CEREBRAS_BASE,
-            api_key=key,
-            model=model,
-            temperature=0.0,
-            max_tokens=4096,
-            timeout=60,
-            max_retries=2,
-        )
-    except Exception as e:
-        print(f"[Cerebras] LLM init error: {e}", flush=True)
-        return None
-
-
-# ── Cloudflare fallback LLM (custom LangChain wrapper) ────────────────────────
-def _cf_text_sync(account_id: str, api_key: str, model: str, messages: list) -> str:
-    """Synchronous Cloudflare text call used by the custom LLM wrapper."""
-    import urllib.request as ur
-    url = f"https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/run/{model}"
-    body = json.dumps({"messages": messages}).encode()
-    req = ur.Request(url, data=body, method="POST", headers={
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type":  "application/json",
-    })
-    try:
-        with ur.urlopen(req, timeout=60) as r:
-            data = json.loads(r.read())
-        result = data.get("result", {}) or {}
-        choices = result.get("choices") or []
-        if choices:
-            return choices[0].get("message", {}).get("content", "") or ""
-        return result.get("response", "") or ""
-    except Exception as e:
-        print(f"[Cloudflare] text error: {e}", flush=True)
-        return ""
-
-
-def make_cloudflare_llm(account_id: str, api_key: str, model: str) -> Optional[Any]:
-    """Wrap Cloudflare AI as a LangChain BaseChatModel."""
-    if not LANGCHAIN_OK:
-        return None
-    try:
-        from langchain_core.language_models.chat_models import BaseChatModel
-        from langchain_core.messages import BaseMessage, AIMessage
-        from langchain_core.outputs import ChatGeneration, ChatResult
-        from typing import Iterator
-
-        class CloudflareChatModel(BaseChatModel):
-            account_id: str
-            api_key: str
-            model: str
-
-            def _generate(self, messages: List[BaseMessage], stop=None, run_manager=None, **kwargs) -> ChatResult:
-                lc_messages = [{"role": "system" if m.type == "system" else "user" if m.type == "human" else "assistant", "content": str(m.content)} for m in messages]
-                reply = _cf_text_sync(self.account_id, self.api_key, self.model, lc_messages)
-                gen = ChatGeneration(message=AIMessage(content=reply or "I was unable to process this request."))
-                return ChatResult(generations=[gen])
-
-            @property
-            def _llm_type(self) -> str:
-                return "cloudflare"
-
-        return CloudflareChatModel(account_id=account_id, api_key=api_key, model=model)
-    except Exception as e:
-        print(f"[Cloudflare] LLM wrapper error: {e}", flush=True)
-        return None
-
-
-# ── Screenshot helper ──────────────────────────────────────────────────────────
-async def take_page_screenshot(browser_session, task_id: str, step: int, label: str, supabase=None) -> Optional[str]:
-    """Capture a screenshot from the active browser page."""
-    try:
-        # browser-use stores the current page in the browser session
         page = None
-        try:
-            if hasattr(browser_session, "get_current_page"):
-                page = await browser_session.get_current_page()
-            elif hasattr(browser_session, "current_page"):
-                page = browser_session.current_page
-            elif hasattr(browser_session, "_context") and browser_session._context:
-                ctx = browser_session._context
-                if hasattr(ctx, "pages") and ctx.pages:
+
+        # browser-use ≥ 0.1.40: BrowserSession.get_current_page()
+        if hasattr(browser_obj, "get_current_page"):
+            try:
+                page = await browser_obj.get_current_page()
+            except Exception:
+                pass
+
+        # Some versions expose .current_page directly
+        if page is None and hasattr(browser_obj, "current_page"):
+            page = browser_obj.current_page
+
+        # Fallback: dig into the playwright context
+        if page is None:
+            for attr in ("_context", "context", "_browser_context"):
+                ctx = getattr(browser_obj, attr, None)
+                if ctx and hasattr(ctx, "pages") and ctx.pages:
                     page = ctx.pages[-1]
-        except Exception:
-            pass
+                    break
 
         if page is None:
             return None
 
-        buf = await page.screenshot(type="jpeg", quality=45, full_page=False, timeout=10000)
+        buf = await page.screenshot(type="jpeg", quality=50, full_page=False, timeout=15000)
         b64 = base64.b64encode(buf).decode()
-        # Re-compress if too large
-        if len(b64) > 400_000:
-            buf = await page.screenshot(type="jpeg", quality=25, full_page=False, timeout=10000)
+
+        # Re-compress if too large (> 350 KB base64 ≈ ~262 KB binary)
+        if len(b64) > 350_000:
+            buf = await page.screenshot(type="jpeg", quality=25, full_page=False, timeout=15000)
             b64 = base64.b64encode(buf).decode()
+
         log_screenshot(task_id, b64, label, supabase)
         return b64
+
     except Exception as e:
         print(f"[Screenshot] Step {step} failed: {e}", flush=True)
         return None
 
 
-# ── Main agent runner ──────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# Main agent runner
+# ─────────────────────────────────────────────────────────────────────────────
 async def run_browser_use_agent(
     task_id: str,
     prompt: str,
@@ -425,220 +587,308 @@ async def run_browser_use_agent(
     supabase=None,
     nopecha_key: str = "",
 ) -> dict:
-    """Run the browser-use agent and stream logs + screenshots to Supabase."""
+    """
+    Run the browser-use agent and stream logs + screenshots to Supabase.
+
+    LLM selection order:
+      1. Cerebras  (llama-3.3-70b → llama3.1-8b)  via JSON-mode wrapper
+      2. Cloudflare Workers AI text model            via JSON-mode wrapper
+    """
 
     if not BROWSER_USE_OK:
         return {"success": False, "summary": "browser-use library not installed", "steps": 0}
 
-    # ── Pick LLM ──────────────────────────────────────────────────────────────
-    llm = None
+    # ── LLM selection ─────────────────────────────────────────────────────────
+    llm       = None
     llm_label = ""
+    used_key  = None
 
-    if cerebras_pool and (CEREBRAS_LANGCHAIN_OK or LANGCHAIN_OK):
+    if cerebras_pool and cerebras_pool.size > 0 and (CEREBRAS_LANGCHAIN_OK or LANGCHAIN_OK):
         key = cerebras_pool.next_key()
         if key:
-            # Use the JSON-mode wrapper — bypasses tool-calling which Cerebras mishandles
+            used_key = key
             for model in CEREBRAS_MODELS:
                 try:
                     candidate = make_cerebras_llm(api_key=key, model=model)
                     if candidate is not None:
-                        llm = candidate
-                        llm_label = f"Cerebras {model} (JSON-mode)"
-                        log(task_id, f"⚡ Cerebras LLM ready: {model}", "info", supabase)
+                        llm       = candidate
+                        llm_label = f"Cerebras/{model}"
+                        log(task_id, f"⚡ Using Cerebras LLM: {model}", "info", supabase)
                         break
                 except Exception as e:
-                    print(f"[Cerebras] {model} init failed: {e}", flush=True)
-                    continue
+                    print(f"[Cerebras] {model} init error: {e}", flush=True)
 
-    if llm is None and cf_account_id and cf_api_key and LANGCHAIN_OK:
+    if llm is None and cf_account_id and cf_api_key:
         try:
             candidate = make_cloudflare_llm(cf_account_id, cf_api_key, cf_model)
             if candidate:
-                llm = candidate
-                llm_label = f"Cloudflare {cf_model}"
-                log(task_id, f"☁️ Cloudflare LLM ready: {cf_model}", "info", supabase)
+                llm       = candidate
+                llm_label = f"Cloudflare/{cf_model.split('/')[-1]}"
+                log(task_id, f"☁️ Using Cloudflare LLM: {cf_model}", "info", supabase)
         except Exception as e:
             print(f"[Cloudflare] LLM setup error: {e}", flush=True)
 
     if llm is None:
-        msg = "No AI provider available — add Cerebras or Cloudflare keys in Settings"
+        msg = "No AI provider available — add Cerebras or Cloudflare API keys in Settings"
         log(task_id, f"✗ {msg}", "error", supabase)
         return {"success": False, "summary": msg, "steps": 0}
 
     log(task_id, f"🤖 AI Engine: {llm_label}", "info", supabase)
-    log(task_id, f"📋 Task: {prompt[:150]}{'…' if len(prompt) > 150 else ''}", "info", supabase)
+    log(task_id, f"📋 Task: {prompt[:200]}{'…' if len(prompt) > 200 else ''}", "info", supabase)
 
-    # ── Browser config ─────────────────────────────────────────────────────────
-    browser_config = BrowserConfig(
+    # ── Browser configuration ──────────────────────────────────────────────────
+    chromium_args = [
+        "--no-sandbox",
+        "--disable-setuid-sandbox",
+        "--disable-blink-features=AutomationControlled",
+        "--disable-dev-shm-usage",
+        "--disable-gpu",
+        "--window-size=1366,768",
+        "--disable-infobars",
+        "--no-first-run",
+        "--disable-extensions",
+        "--disable-background-networking",
+        "--disable-default-apps",
+        "--no-default-browser-check",
+        "--hide-scrollbars",
+        "--mute-audio",
+        "--disable-translate",
+        "--safebrowsing-disable-auto-update",
+        "--disable-sync",
+    ]
+
+    browser_cfg_kwargs: dict = dict(
         headless=True,
         disable_security=False,
-        extra_chromium_args=[
-            "--no-sandbox",
-            "--disable-setuid-sandbox",
-            "--disable-blink-features=AutomationControlled",
-            "--disable-dev-shm-usage",
-            "--disable-gpu",
-            "--window-size=1366,768",
-            "--disable-infobars",
-            "--no-first-run",
-            "--disable-extensions",
-        ],
+        extra_chromium_args=chromium_args,
     )
 
-    browser = Browser(config=browser_config)
-
-    # ── Step tracking ──────────────────────────────────────────────────────────
-    step_count     = [0]
-    browser_holder = [None]  # capture browser session reference for screenshots
-
-    async def on_step_start(state: Any, output: Any, step_num: int):
-        step_count[0] = step_num
+    # BrowserContextConfig (available in some versions)
+    if BrowserContextConfig is not None:
         try:
-            current_url = ""
-            if hasattr(state, "url"):
-                current_url = state.url[:80]
-            elif hasattr(state, "tabs") and state.tabs:
-                current_url = str(state.tabs[-1])[:80]
-
-            action_desc = ""
-            if output and hasattr(output, "current_state"):
-                cs = output.current_state
-                if hasattr(cs, "next_goal"):
-                    action_desc = str(cs.next_goal)[:120]
-                elif hasattr(cs, "evaluation_previous_goal"):
-                    action_desc = str(cs.evaluation_previous_goal)[:120]
-            if not action_desc and output:
-                action_desc = str(output)[:120]
-
-            msg = f"⚙️ Step {step_num}" + (f" — {action_desc}" if action_desc else "") + (f" | {current_url}" if current_url else "")
-            log(task_id, msg, "info", supabase)
-        except Exception as e:
-            log(task_id, f"⚙️ Step {step_num}", "info", supabase)
-
-    async def on_step_end(state: Any, output: Any, step_num: int):
-        """Called after each step — capture screenshot every N steps."""
-        try:
-            if step_num % SCREENSHOT_EVERY == 0 or step_num == 1:
-                # Try to get screenshot from browser state
-                screenshot_b64 = None
-
-                # browser-use may provide screenshot in state directly
-                if hasattr(state, "screenshot") and state.screenshot:
-                    screenshot_b64 = state.screenshot
-                    size_kb = len(screenshot_b64) // 1024
-                    print(f"[Screenshot] Got from state ({size_kb}KB)", flush=True)
-                    log_screenshot(task_id, screenshot_b64, f"Step {step_num}", supabase)
-                else:
-                    # Fallback: capture directly from the browser session
-                    session = browser_holder[0]
-                    if session:
-                        await take_page_screenshot(session, task_id, step_num, f"Step {step_num}", supabase)
-
-                # Log action details
-                if output:
-                    try:
-                        actions = []
-                        if hasattr(output, "action"):
-                            acts = output.action if isinstance(output.action, list) else [output.action]
-                            for act in acts:
-                                if act:
-                                    actions.append(str(act)[:100])
-                        if actions:
-                            log(task_id, f"🔧 Actions: {' | '.join(actions[:3])}", "info", supabase)
-                    except Exception:
-                        pass
-        except Exception as e:
-            print(f"[StepEnd] {e}", flush=True)
-
-    # ── Run agent ──────────────────────────────────────────────────────────────
-    try:
-        log(task_id, "🚀 Launching browser-use agent…", "info", supabase)
-
-        async def combined_step_cb(state: Any, output: Any, step_num: int):
-            await on_step_start(state, output, step_num)
-            await on_step_end(state, output, step_num)
-
-        agent = Agent(
-            task=prompt,
-            llm=llm,
-            browser=browser,
-            register_new_step_callback=combined_step_cb,
-            register_done_callback=None,
-            max_failures=3,
-            retry_delay=3,
-        )
-
-        # Capture browser session reference for screenshots
-        if hasattr(agent, "browser") and agent.browser:
-            browser_holder[0] = agent.browser
-        elif hasattr(agent, "_browser"):
-            browser_holder[0] = agent._browser
-
-        # Run with a generous step limit
-        history = await agent.run(max_steps=50)
-
-        # ── Extract result ─────────────────────────────────────────────────────
-        success = True
-        summary = ""
-
-        if history:
-            try:
-                # browser-use AgentHistoryList has various result accessors
-                if hasattr(history, "final_result"):
-                    result_val = history.final_result()
-                    if result_val:
-                        summary = str(result_val)
-                if not summary and hasattr(history, "extracted_content"):
-                    content = history.extracted_content()
-                    if content:
-                        summary = "\n".join(str(c) for c in content if c)
-                if not summary:
-                    summary = str(history)[:1000]
-            except Exception as he:
-                summary = f"Task completed in {step_count[0]} steps. History parse error: {he}"
-        else:
-            summary = f"Task completed in {step_count[0]} steps."
-
-        # Check for errors in history
-        try:
-            if history and hasattr(history, "has_errors") and history.has_errors():
-                errors = history.errors() if hasattr(history, "errors") else []
-                if errors:
-                    log(task_id, f"⚠️ Agent encountered {len(errors)} error(s) during execution", "warning", supabase)
+            ctx_cfg = BrowserContextConfig(
+                wait_for_network_idle_page_load_time=2.0,
+                browser_window_size={"width": 1366, "height": 768},
+            )
+            browser_cfg_kwargs["new_context_config"] = ctx_cfg
         except Exception:
             pass
 
-        log(task_id, f"✅ Task complete!\n{summary[:600]}", "success", supabase)
+    try:
+        browser_cfg = BrowserConfig(**browser_cfg_kwargs)
+    except TypeError:
+        # Older versions may not support all kwargs
+        browser_cfg_kwargs.pop("new_context_config", None)
+        browser_cfg = BrowserConfig(**browser_cfg_kwargs)
 
-        # Final screenshot
-        session = browser_holder[0]
-        if session:
-            await take_page_screenshot(session, task_id, step_count[0], "Final state", supabase)
+    browser = Browser(config=browser_cfg)
 
-        return {
-            "success": success,
-            "summary": summary[:2000],
-            "steps":   step_count[0],
-        }
+    # ── Step tracking ──────────────────────────────────────────────────────────
+    step_count     = [0]
+    browser_holder = [None]  # holds browser reference for screenshot capture
+
+    async def on_step(state: Any, output: Any, step_num: int):
+        """
+        Called by browser-use after each agent step.
+        Logs goal/action details and captures periodic screenshots.
+
+        Supports both browser-use 0.1.x and 0.2.x callback signatures.
+        """
+        step_count[0] = step_num
+
+        # Extract current URL
+        current_url = ""
+        for attr in ("url", "current_url"):
+            val = getattr(state, attr, None)
+            if val:
+                current_url = str(val)[:100]
+                break
+        if not current_url and hasattr(state, "tabs") and state.tabs:
+            try:
+                current_url = str(state.tabs[-1])[:100]
+            except Exception:
+                pass
+
+        # Extract goal / action description
+        goal = ""
+        if output is not None:
+            for path in (
+                ("current_state", "next_goal"),
+                ("current_state", "memory"),
+                ("current_state", "evaluation_previous_goal"),
+            ):
+                try:
+                    val = output
+                    for attr in path:
+                        val = getattr(val, attr, None)
+                        if val is None:
+                            break
+                    if val:
+                        goal = str(val)[:150]
+                        break
+                except Exception:
+                    pass
+
+            if not goal:
+                try:
+                    goal = str(output)[:150]
+                except Exception:
+                    pass
+
+        msg = f"⚙️ Step {step_num}"
+        if goal:
+            msg += f" — {goal}"
+        if current_url:
+            msg += f"\n   🌐 {current_url}"
+        log(task_id, msg, "info", supabase)
+
+        # Log action names
+        if output is not None:
+            try:
+                actions = getattr(output, "action", None)
+                if actions is not None:
+                    acts  = actions if isinstance(actions, list) else [actions]
+                    descs = [str(a)[:100] for a in acts[:3] if a is not None]
+                    if descs:
+                        log(task_id, f"🔧 Actions: {' | '.join(descs)}", "info", supabase)
+            except Exception:
+                pass
+
+        # Periodic screenshot
+        if step_num % SCREENSHOT_EVERY == 0 or step_num == 1:
+            # Check if state carries a screenshot already
+            ss_b64 = getattr(state, "screenshot", None)
+            if ss_b64:
+                log_screenshot(task_id, ss_b64, f"Step {step_num}", supabase)
+            else:
+                session = browser_holder[0]
+                if session:
+                    await capture_screenshot(
+                        session, task_id, step_num, f"Step {step_num}", supabase
+                    )
+
+    # ── Create and run the Agent ───────────────────────────────────────────────
+    history = None
+    try:
+        log(task_id, "🚀 Launching browser-use agent…", "info", supabase)
+
+        # Build Agent kwargs — probe callback kwarg name (varies by version)
+        agent_kwargs: dict = dict(
+            task=prompt,
+            llm=llm,
+            browser=browser,
+            max_failures=5,
+        )
+
+        # Try each known callback kwarg name
+        agent = None
+        for cb_kwarg in ("register_new_step_callback", "on_step_start", "step_callback"):
+            try:
+                test_kwargs = {**agent_kwargs, cb_kwarg: on_step}
+                agent = Agent(**test_kwargs)
+                agent_kwargs = test_kwargs
+                print(f"[Agent] Using callback kwarg: {cb_kwarg}", flush=True)
+                break
+            except TypeError:
+                pass
+
+        if agent is None:
+            # No callback support — run without it
+            agent = Agent(**agent_kwargs)
+            print("[Agent] Running without step callback (version may not support it)", flush=True)
+
+        # Capture browser reference for manual screenshots
+        for attr in ("browser", "_browser", "browser_session", "_browser_session"):
+            ref = getattr(agent, attr, None)
+            if ref is not None:
+                browser_holder[0] = ref
+                break
+
+        # Run the agent (generous step limit)
+        history = await agent.run(max_steps=50)
+
+        # Mark the Cerebras key as working
+        if used_key and cerebras_pool:
+            cerebras_pool.failed.discard(used_key)
 
     except Exception as e:
         tb = traceback.format_exc()
         print(f"[Agent] Fatal error:\n{tb}", flush=True)
-        log(task_id, f"✗ Agent error: {str(e)[:300]}", "error", supabase)
-        return {
-            "success": False,
-            "summary": f"Agent error: {str(e)[:500]}",
-            "steps":   step_count[0],
-        }
-    finally:
+        if used_key and cerebras_pool and ("401" in str(e) or "403" in str(e)):
+            cerebras_pool.mark_failed(used_key)
+        log(task_id, f"✗ Agent error: {str(e)[:400]}", "error", supabase)
         try:
             await browser.close()
         except Exception:
             pass
+        return {
+            "success": False,
+            "summary": f"Agent error: {str(e)[:600]}",
+            "steps":   step_count[0],
+        }
+
+    # ── Extract result from history ────────────────────────────────────────────
+    summary = ""
+    success = True
+
+    if history is not None:
+        try:
+            for method in ("final_result", "extracted_content", "last_action"):
+                fn = getattr(history, method, None)
+                if callable(fn):
+                    try:
+                        val = fn()
+                        if val:
+                            summary = (
+                                "\n".join(str(v) for v in val if v)
+                                if isinstance(val, (list, tuple))
+                                else str(val)
+                            )
+                            break
+                    except Exception:
+                        pass
+
+            if not summary:
+                summary = str(history)[:1200]
+
+        except Exception as he:
+            summary = f"Task ran for {step_count[0]} steps (result parse error: {he})"
+
+        # Check for errors in history
+        try:
+            if hasattr(history, "has_errors") and history.has_errors():
+                errs      = getattr(history, "errors", lambda: [])()
+                err_count = len(errs) if hasattr(errs, "__len__") else "some"
+                log(task_id, f"⚠️ Agent encountered {err_count} error(s)", "warning", supabase)
+        except Exception:
+            pass
+    else:
+        summary = f"Task completed in {step_count[0]} steps."
+
+    if not summary:
+        summary = f"Task completed in {step_count[0]} steps."
+
+    log(task_id, f"✅ Task complete!\n{summary[:800]}", "success", supabase)
+
+    # Final screenshot
+    session = browser_holder[0]
+    if session:
+        await capture_screenshot(session, task_id, step_count[0], "Final state", supabase)
+
+    try:
+        await browser.close()
+    except Exception:
+        pass
+
+    return {"success": success, "summary": summary[:2000], "steps": step_count[0]}
 
 
-# ── Task Runner ────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# Task runner
+# ─────────────────────────────────────────────────────────────────────────────
 async def run_task(task_id: str):
+    """Fetch a task from Supabase and execute it via the browser-use agent."""
+
     supabase = None
     if SUPABASE_AVAILABLE and SUPABASE_URL and SUPABASE_SVC_KEY:
         try:
@@ -647,13 +897,13 @@ async def run_task(task_id: str):
         except Exception as e:
             print(f"[Supabase] Connection failed: {e}", flush=True)
     else:
-        print(f"[WARN] Supabase not configured — no real-time logging", flush=True)
+        print("[WARN] Supabase not configured — logs go to stdout only", flush=True)
 
-    # ── Fetch task ─────────────────────────────────────────────────────────────
+    # Fetch task record
     task = None
     if supabase:
         try:
-            res = supabase.table("tasks").select("*").eq("id", task_id).single().execute()
+            res  = supabase.table("tasks").select("*").eq("id", task_id).single().execute()
             task = res.data
         except Exception as e:
             print(f"[ERROR] Fetch task: {e}", flush=True)
@@ -668,15 +918,15 @@ async def run_task(task_id: str):
     if not prompt:
         log(task_id, "✗ Task has no prompt", "error", supabase)
         update_task_status(task_id, "failed",
-            {"success": False, "summary": "Task has no prompt", "completedAt": datetime.utcnow().isoformat()},
+            {"success": False, "summary": "Task has no prompt",
+             "completedAt": datetime.utcnow().isoformat()},
             supabase)
         return
 
-    # Mark running immediately
     update_task_status(task_id, "running", None, supabase)
-    log(task_id, "🚀 AutoAgent Pro starting — browser-use engine", "info", supabase)
+    log(task_id, "🚀 AutoAgent Pro starting — browser-use engine v7", "info", supabase)
 
-    # ── Load user settings ─────────────────────────────────────────────────────
+    # ── Load user settings from Supabase ──────────────────────────────────────
     cerebras_keys: List[str] = []
     cf_account_id = CF_ACCOUNT_ID_ENV
     cf_api_key    = CF_API_KEY_ENV
@@ -685,55 +935,81 @@ async def run_task(task_id: str):
 
     if supabase and user_id:
         try:
-            s_res = supabase.table("settings").select("*").eq("user_id", user_id).single().execute()
-            settings = s_res.data
-            if settings:
-                cerebras_keys = settings.get("cerebras_keys") or []
+            s_res    = supabase.table("settings").select("*").eq("user_id", user_id).single().execute()
+            settings = s_res.data or {}
 
-                # Parse Cloudflare credentials (new multi-account JSON format)
-                raw_cf_keys = settings.get("cloudflare_keys") or []
-                legacy_acct = settings.get("cloudflare_account_id", "") or cf_account_id
-                for item in raw_cf_keys:
-                    item = (item or "").strip()
-                    if not item:
-                        continue
-                    try:
-                        obj = json.loads(item)
-                        if isinstance(obj, dict) and obj.get("api_key"):
-                            if obj.get("enabled", True):
-                                cf_account_id = obj.get("account_id") or legacy_acct
-                                cf_api_key    = obj["api_key"]
-                                cf_model      = obj.get("model") or cf_model
-                                log(task_id, f"☁️ Using Cloudflare cred: {obj.get('label','')}", "info", supabase)
-                                break
-                    except Exception:
-                        # Legacy plain key
-                        if legacy_acct and item:
-                            cf_account_id = legacy_acct
-                            cf_api_key    = item
-                            break
+            # Cerebras keys (array of plain key strings)
+            raw_cerebras  = settings.get("cerebras_keys") or []
+            cerebras_keys = [k.strip() for k in raw_cerebras if k and k.strip()]
 
-                nopecha_key   = settings.get("nopecha_key") or nopecha_key
-                if settings.get("cloudflare_model"):
-                    cf_model = settings["cloudflare_model"]
+            # Cloudflare credentials (new multi-account JSON format)
+            raw_cf_keys = settings.get("cloudflare_keys") or []
+            legacy_acct = settings.get("cloudflare_account_id", "") or cf_account_id
 
-                log(task_id, f"⚡ Cerebras keys: {len(cerebras_keys)} | ☁️ CF: {'yes' if cf_account_id and cf_api_key else 'no'}", "info", supabase)
+            for item in raw_cf_keys:
+                item = (item or "").strip()
+                if not item:
+                    continue
+                try:
+                    obj = json.loads(item)
+                    if isinstance(obj, dict) and obj.get("api_key") and obj.get("enabled", True):
+                        cf_account_id = obj.get("account_id") or legacy_acct
+                        cf_api_key    = obj["api_key"]
+                        cf_model      = obj.get("model") or cf_model
+                        log(task_id, f"☁️ Cloudflare credential: {obj.get('label', 'unnamed')}", "info", supabase)
+                        break
+                except Exception:
+                    # Legacy plain key format
+                    if legacy_acct and item:
+                        cf_account_id = legacy_acct
+                        cf_api_key    = item
+                        break
+
+            if settings.get("nopecha_key"):
+                nopecha_key = settings["nopecha_key"]
+            if settings.get("cloudflare_model"):
+                cf_model = settings["cloudflare_model"]
+
+            log(
+                task_id,
+                f"⚡ Cerebras keys loaded: {len(cerebras_keys)} | "
+                f"☁️ Cloudflare: {'yes' if cf_account_id and cf_api_key else 'no'}",
+                "info",
+                supabase,
+            )
         except Exception as e:
             print(f"[WARN] Settings load: {e}", flush=True)
 
-    # Fall back to env vars if no user keys
+    # Fall back to GitHub Actions env vars / secrets
     if not cerebras_keys:
+        # Multi-key env var (comma-separated)
         env_keys = os.environ.get("CEREBRAS_API_KEYS", "")
         if env_keys:
             cerebras_keys = [k.strip() for k in env_keys.split(",") if k.strip()]
-            if cerebras_keys:
-                log(task_id, f"⚡ Using env Cerebras keys ({len(cerebras_keys)})", "info", supabase)
+        # Single-key env var
+        if not cerebras_keys:
+            single = os.environ.get("CEREBRAS_API_KEY", "")
+            if single.strip():
+                cerebras_keys = [single.strip()]
+        if cerebras_keys:
+            log(task_id, f"⚡ Using env Cerebras keys ({len(cerebras_keys)})", "info", supabase)
+
+    if not cf_account_id or not cf_api_key:
+        env_cf_id  = os.environ.get("CLOUDFLARE_ACCOUNT_ID", "")
+        env_cf_key = os.environ.get("CLOUDFLARE_API_KEY", "")
+        if env_cf_id and env_cf_key:
+            cf_account_id = env_cf_id
+            cf_api_key    = env_cf_key
 
     if not cerebras_keys and not (cf_account_id and cf_api_key):
-        msg = "No AI keys configured. Add Cerebras or Cloudflare API keys in Settings."
+        msg = (
+            "No AI API keys configured. "
+            "Add Cerebras or Cloudflare API keys in Settings → AI Providers."
+        )
         log(task_id, f"✗ {msg}", "error", supabase)
         update_task_status(task_id, "failed",
-            {"success": False, "summary": msg, "completedAt": datetime.utcnow().isoformat()},
+            {"success": False, "summary": msg,
+             "completedAt": datetime.utcnow().isoformat()},
             supabase)
         return
 
@@ -754,7 +1030,7 @@ async def run_task(task_id: str):
     except Exception as e:
         tb = traceback.format_exc()
         print(f"[Task] Fatal:\n{tb}", flush=True)
-        result = {"success": False, "summary": f"Fatal error: {str(e)[:300]}", "steps": 0}
+        result = {"success": False, "summary": f"Fatal error: {str(e)[:400]}", "steps": 0}
 
     # ── Store result ───────────────────────────────────────────────────────────
     final_status = "completed" if result.get("success") else "failed"
@@ -771,25 +1047,35 @@ async def run_task(task_id: str):
     )
 
     log_type = "success" if result.get("success") else "error"
-    log(task_id, f"{'✅ Completed' if result['success'] else '✗ Failed'}: {result.get('summary','')[:400]}", log_type, supabase)
-    print(f"\n[Task] {task_id} → {final_status} ({result.get('steps',0)} steps)", flush=True)
+    log(
+        task_id,
+        f"{'✅ Completed' if result['success'] else '✗ Failed'}: {result.get('summary','')[:400]}",
+        log_type,
+        supabase,
+    )
+    print(f"\n[Task] {task_id} → {final_status} ({result.get('steps', 0)} steps)", flush=True)
 
 
-# ── Entry point ────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# Entry point
+# ─────────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     if len(sys.argv) < 2:
         print("Usage: python browser_use_worker.py <task_id>", flush=True)
         sys.exit(1)
 
     task_id = sys.argv[1].strip()
-    print(f"\n{'='*60}", flush=True)
-    print(f"[AutoAgent Pro] browser-use worker v5", flush=True)
+    print(f"\n{'=' * 60}", flush=True)
+    print(f"[AutoAgent Pro] browser-use worker v7", flush=True)
     print(f"[AutoAgent Pro] Task ID: {task_id}", flush=True)
-    print(f"{'='*60}\n", flush=True)
+    print(f"{'=' * 60}\n", flush=True)
 
     if not BROWSER_USE_OK:
         print("[FATAL] browser-use library not available. Install with:", flush=True)
-        print("  pip install browser-use langchain-openai langchain", flush=True)
+        print(
+            "  pip install 'browser-use>=0.1.40' langchain-openai langchain-cerebras",
+            flush=True,
+        )
         sys.exit(1)
 
     asyncio.run(run_task(task_id))

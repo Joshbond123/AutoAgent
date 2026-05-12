@@ -4,7 +4,7 @@
  * NOTE: Production task execution now uses browser-use (Python):
  *   scripts/browser_use_worker.py — the primary GitHub Actions worker
  *
- * Primary AI:  Cerebras gpt-oss-120b (via LangChain OpenAI wrapper)
+ * Primary AI:  Cerebras llama-3.3-70b (via OpenAI-compat API)
  * Vision AI:   Cloudflare Workers AI kimi-k2.6 (screenshot analysis)
  * Browser:     browser-use library (Playwright + stealth + human-like behaviour)
  *

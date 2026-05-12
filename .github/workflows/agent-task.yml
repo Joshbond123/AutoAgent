@@ -46,54 +46,125 @@ jobs:
             libxfixes3 \
             libxext6 || true
 
-      - name: Install Python packages (browser-use + langchain + supabase)
+      - name: Install Python packages
         run: |
           pip install --upgrade pip --quiet
+
+          # Core browser-use + LangChain stack
           pip install \
-            "browser-use==0.1.40" \
-            "langchain-cerebras>=0.1.0" \
+            "browser-use>=0.1.40" \
             "langchain-openai>=0.2.0" \
+            "langchain-cerebras>=0.1.0" \
             "langchain>=0.3.0" \
             "langchain-core>=0.3.0" \
-            playwright \
-            httpx \
+            "pydantic>=2.0.0" \
+            --quiet
+
+          # Playwright + browser automation
+          pip install playwright --quiet
+
+          # Supabase + HTTP
+          pip install \
             "supabase>=2.0.0" \
+            httpx \
             python-dotenv \
             --quiet
-          python -c "import browser_use; print('browser-use version:', browser_use.__version__)" || true
+
+          echo "=== Package versions ==="
+          pip show browser-use langchain-openai langchain-cerebras langchain pydantic 2>/dev/null | grep -E "^(Name|Version):" || true
 
       - name: Install Playwright browser (Chromium)
         run: playwright install chromium --with-deps
 
       - name: Validate environment
         run: |
-          python -c "from browser_use import Agent; print('browser-use Agent OK')"
-          python -c "from langchain_cerebras import ChatCerebras; print('langchain-cerebras OK')"
-          python -c "from langchain_openai import ChatOpenAI; print('langchain-openai OK')"
-          python -c "from supabase import create_client; print('supabase OK')"
-          python -c "import httpx; print('httpx OK')"
-          python -c "import playwright; print('playwright OK')"
+          echo "=== Import validation ==="
+          python -c "
+          import sys
+
+          errors = []
+
+          try:
+              from browser_use import Agent
+              print('✓ browser-use Agent')
+          except ImportError as e:
+              errors.append(f'✗ browser-use: {e}')
+
+          try:
+              from langchain_cerebras import ChatCerebras
+              print('✓ langchain-cerebras ChatCerebras')
+          except ImportError as e:
+              print(f'  (optional) langchain-cerebras: {e}')
+
+          try:
+              from langchain_openai import ChatOpenAI
+              print('✓ langchain-openai ChatOpenAI')
+          except ImportError as e:
+              errors.append(f'✗ langchain-openai: {e}')
+
+          try:
+              from langchain_core.runnables import RunnableLambda
+              print('✓ langchain-core RunnableLambda')
+          except ImportError as e:
+              errors.append(f'✗ langchain-core: {e}')
+
+          try:
+              from supabase import create_client
+              print('✓ supabase-py')
+          except ImportError as e:
+              errors.append(f'✗ supabase: {e}')
+
+          try:
+              import playwright
+              print('✓ playwright')
+          except ImportError as e:
+              errors.append(f'✗ playwright: {e}')
+
+          if errors:
+              print('ERRORS:')
+              for e in errors:
+                  print(' ', e)
+              sys.exit(1)
+          else:
+              print('All required packages OK')
+          "
+
+          echo "=== Browser-use API check ==="
           python -c "
           try:
-            from browser_use import Browser, BrowserConfig
-            print('browser-use Browser/BrowserConfig: top-level import OK')
+              from browser_use import Browser, BrowserConfig
+              print('✓ Browser/BrowserConfig: top-level import')
           except ImportError:
-            try:
-              from browser_use.browser.browser import Browser, BrowserConfig
-              print('browser-use Browser/BrowserConfig: browser.browser import OK')
-            except ImportError:
-              print('browser-use Browser/BrowserConfig: using Agent-only mode')
+              try:
+                  from browser_use.browser.browser import Browser, BrowserConfig
+                  print('✓ Browser/BrowserConfig: browser.browser import')
+              except ImportError:
+                  print('  Browser/BrowserConfig not found — Agent-only mode')
+
+          try:
+              from browser_use.browser.context import BrowserContextConfig
+              print('✓ BrowserContextConfig available')
+          except ImportError:
+              print('  BrowserContextConfig not found (optional)')
           "
+
+          echo "=== Worker syntax check ==="
+          python -m py_compile scripts/browser_use_worker.py && echo "✓ browser_use_worker.py syntax OK"
+          python -m py_compile scripts/run_pending_tasks.py  && echo "✓ run_pending_tasks.py syntax OK"
 
       - name: Run agent task
         env:
           SUPABASE_URL:              ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          # Cerebras keys — comma-separated list for key rotation
           CEREBRAS_API_KEYS:         ${{ secrets.CEREBRAS_API_KEYS }}
-          NOPECHA_API_KEY:           ${{ secrets.NOPECHA_API_KEY }}
+          CEREBRAS_API_KEY:          ${{ secrets.CEREBRAS_API_KEY }}
+          # Cloudflare fallback
           CLOUDFLARE_ACCOUNT_ID:     ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           CLOUDFLARE_API_KEY:        ${{ secrets.CLOUDFLARE_API_KEY }}
           CLOUDFLARE_MODEL:          ${{ secrets.CLOUDFLARE_MODEL }}
+          # Optional CAPTCHA solver
+          NOPECHA_API_KEY:           ${{ secrets.NOPECHA_API_KEY }}
           TASK_ID:                   ${{ github.event.inputs.task_id }}
         run: |
           if [ -n "$TASK_ID" ]; then

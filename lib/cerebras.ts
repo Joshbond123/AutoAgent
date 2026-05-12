@@ -1,7 +1,9 @@
 /**
  * AutoAgent Pro — Cerebras AI Client
- * Model: gpt-oss-120b (ultra-fast inference via Cerebras Wafer-Scale Engine)
- * Supports: unlimited key rotation, automatic failover
+ * Models: llama-3.3-70b (primary), llama3.1-8b (fallback)
+ * API:    OpenAI-compatible endpoint at https://api.cerebras.ai/v1
+ * Ref:    https://inference-docs.cerebras.ai/resources/openai
+ * Supports: unlimited key rotation, automatic failover, JSON mode
  */
 
 const CEREBRAS_BASE = "https://api.cerebras.ai/v1";
@@ -52,7 +54,8 @@ export class CerebrasClient {
       jsonMode?: boolean;
     } = {}
   ): Promise<string> {
-    const model = options.model || "gpt-oss-120b";
+    // llama-3.3-70b — best tool-call + structured output support on Cerebras
+    const model = options.model || "llama-3.3-70b";
     const maxRetries = Math.min(this.keys.length + 1, 5);
 
     for (let attempt = 0; attempt < maxRetries; attempt++) {
