@@ -13,7 +13,7 @@ on:
 jobs:
   run-agent:
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 30
 
     steps:
       - name: Checkout
@@ -28,7 +28,6 @@ jobs:
         run: |
           sudo apt-get update -q
           sudo apt-get install -y -q \
-            chromium-browser \
             libglib2.0-0 \
             libnss3 \
             libfontconfig1 \
@@ -43,24 +42,34 @@ jobs:
             libgbm1 \
             libxrandr2 \
             libxss1 \
-            libasound2t64 || true
+            libasound2t64 \
+            libxfixes3 \
+            libxext6 || true
 
-      - name: Install Python packages
+      - name: Install Python packages (browser-use + langchain + supabase)
         run: |
           pip install --upgrade pip --quiet
           pip install \
+            "browser-use>=0.1.40" \
+            "langchain-openai>=0.2.0" \
+            "langchain>=0.3.0" \
+            "langchain-core>=0.3.0" \
             playwright \
             httpx \
             "supabase>=2.0.0" \
             python-dotenv \
             --quiet
-          playwright install chromium --with-deps
+
+      - name: Install Playwright browser (Chromium)
+        run: playwright install chromium --with-deps
 
       - name: Validate environment
         run: |
-          python -c "import playwright; print('Playwright OK')"
-          python -c "from supabase import create_client; print('Supabase OK')"
+          python -c "from browser_use import Agent, Browser, BrowserConfig; print('browser-use OK')"
+          python -c "from langchain_openai import ChatOpenAI; print('langchain-openai OK')"
+          python -c "from supabase import create_client; print('supabase OK')"
           python -c "import httpx; print('httpx OK')"
+          python -c "import playwright; print('playwright OK')"
 
       - name: Run agent task
         env:
@@ -74,9 +83,9 @@ jobs:
           TASK_ID:                   ${{ github.event.inputs.task_id }}
         run: |
           if [ -n "$TASK_ID" ]; then
-            echo "Running specific task: $TASK_ID"
+            echo "=== Running specific task: $TASK_ID ==="
             python scripts/browser_use_worker.py "$TASK_ID"
           else
-            echo "Running all pending tasks..."
+            echo "=== Running all pending tasks ==="
             python scripts/run_pending_tasks.py
           fi

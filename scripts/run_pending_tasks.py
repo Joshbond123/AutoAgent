@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""AutoAgent Pro — Run all pending tasks from Supabase."""
+"""
+AutoAgent Pro — Run all pending tasks from Supabase.
+Fetches all tasks with status='pending', runs them sequentially via browser_use_worker.
+"""
 import os
 import sys
 import asyncio
@@ -20,7 +23,7 @@ async def main():
         "Content-Type":  "application/json",
     }
 
-    # NOTE: 'name' removed — select only columns that exist
+    print("[AutoAgent] Querying Supabase for pending tasks…", flush=True)
     async with httpx.AsyncClient(timeout=30) as client:
         res = await client.get(
             f"{SUPABASE_URL}/rest/v1/tasks?status=eq.pending&select=id,prompt&order=created_at.asc",
@@ -40,9 +43,9 @@ async def main():
 
     for task in tasks:
         tid    = task["id"]
-        prompt = task.get("prompt", "")[:80]
+        prompt = task.get("prompt", "")[:100]
         print(f"\n[AutoAgent] ▶ Starting task: {tid}", flush=True)
-        print(f"[AutoAgent]   Prompt: {prompt}", flush=True)
+        print(f"[AutoAgent]   Prompt: {prompt}…" if len(task.get("prompt","")) > 100 else f"[AutoAgent]   Prompt: {prompt}", flush=True)
         print("=" * 60, flush=True)
 
         proc = await asyncio.create_subprocess_exec(
@@ -52,8 +55,8 @@ async def main():
         )
         stdout, _ = await proc.communicate()
         output = stdout.decode(errors="replace")
-        # Print last 5000 chars to avoid log overflow
-        print(output[-5000:], flush=True)
+        # Print last 8000 chars to capture key output
+        print(output[-8000:], flush=True)
         print(f"\n[AutoAgent] Task {tid} exit code: {proc.returncode}", flush=True)
         print("=" * 60, flush=True)
 

@@ -1,8 +1,15 @@
 /**
- * AutoAgent Pro — Autonomous Browser Agent
- * Primary AI:  Cerebras gpt-oss-120b (ultra-fast text reasoning)
+ * AutoAgent Pro — TypeScript Agent (Dev/Testing Reference)
+ *
+ * NOTE: Production task execution now uses browser-use (Python):
+ *   scripts/browser_use_worker.py — the primary GitHub Actions worker
+ *
+ * Primary AI:  Cerebras gpt-oss-120b (via LangChain OpenAI wrapper)
  * Vision AI:   Cloudflare Workers AI kimi-k2.6 (screenshot analysis)
- * Browser:     Playwright with stealth & human-like behaviour
+ * Browser:     browser-use library (Playwright + stealth + human-like behaviour)
+ *
+ * This TypeScript agent is kept for local dev/testing and as a reference
+ * implementation. The Python worker runs in GitHub Actions for production tasks.
  */
 import playwright, { Page, BrowserContext } from "playwright";
 import { CerebrasClient, createCerebrasClient } from "./cerebras.js";
@@ -99,7 +106,7 @@ export class AutonomousAgent {
   }
 
   async initialize(): Promise<void> {
-    this.log("Launching stealth browser (Playwright + anti-detection)…", "info");
+    this.log("Launching stealth browser…", "info");
 
     this.browser = await playwright.chromium.launch({
       headless: true,
@@ -137,11 +144,6 @@ export class AutonomousAgent {
       Object.defineProperty(navigator, "hardwareConcurrency", { get: () => 8 });
       Object.defineProperty(navigator, "deviceMemory", { get: () => 8 });
       (window as any).chrome = { runtime: {} };
-      const origQuery = window.navigator.permissions.query;
-      window.navigator.permissions.query = (p: any) =>
-        p.name === "notifications"
-          ? Promise.resolve({ state: "denied" } as PermissionStatus)
-          : origQuery(p);
     });
 
     this.page = await this.context.newPage();
@@ -326,7 +328,7 @@ PREV PAGES: ${this.pageHistory.slice(-3).join(" → ")}${memStr}`;
             const result = await this.page.evaluate(action.js).catch(() => null);
             const str = String(result || "").slice(0, 600);
             this.memory.push(`${action.label || "data"}: ${str}`);
-            this.log(`📊 Extracted [${action.label}]: ${str.slice(0, 200)}`, "success");
+            this.log(`Extracted [${action.label}]: ${str.slice(0, 200)}`, "success");
           }
           break;
         }
@@ -374,18 +376,17 @@ PREV PAGES: ${this.pageHistory.slice(-3).join(" → ")}${memStr}`;
 
       while (this.stepCount < this.maxSteps) {
         this.stepCount++;
-        this.log(`⚙️ Step ${this.stepCount}/${this.maxSteps}`, "info");
+        this.log(`Step ${this.stepCount}/${this.maxSteps}`, "info");
 
         const screenshot = await this.takeScreenshot();
         this.options.onScreenshot?.(screenshot);
 
-        // Loop detection
         if (recentActions.length >= 4 && new Set(recentActions.slice(-4)).size === 1) {
-          this.log("⚠️ Loop detected — stopping", "warning");
+          this.log("Loop detected — stopping", "warning");
           break;
         }
         if (consecutiveWaits >= 5) {
-          this.log("⚠️ Too many WAITs — stopping", "warning");
+          this.log("Too many WAITs — stopping", "warning");
           break;
         }
 
@@ -394,10 +395,10 @@ PREV PAGES: ${this.pageHistory.slice(-3).join(" → ")}${memStr}`;
           if (this.cerebras) {
             const ctx = await this.getPageContext();
             action = await this.decideWithCerebras(ctx);
-            this.log(`🧠 Cerebras: ${action.action} — ${action.reason?.slice(0, 80)}`, "info");
+            this.log(`Cerebras: ${action.action} — ${action.reason?.slice(0, 80)}`, "info");
           } else {
             action = await this.decideWithCloudflare(screenshot);
-            this.log(`☁️ Cloudflare: ${action.action} — ${action.reason?.slice(0, 80)}`, "info");
+            this.log(`Cloudflare: ${action.action} — ${action.reason?.slice(0, 80)}`, "info");
           }
         } catch (err: any) {
           this.log(`AI error: ${err.message} — trying Cloudflare vision…`, "warning");
