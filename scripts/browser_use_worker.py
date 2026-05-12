@@ -89,51 +89,15 @@ def make_cerebras_llm(api_key: str, model: str):
     """
     try:
         from langchain_core.runnables import RunnableLambda
-        from langchain_core.messages import SystemMessage, AIMessage, BaseMessage
-        import pydantic
+        from langchain_core.messages import SystemMessage
+        import pydantic as _pydantic
     except ImportError as e:
         print(f"[WARN] Cannot build Cerebras LLM wrapper: {e}", flush=True)
         return None
 
-    # Prefer ChatCerebras (native), fall back to ChatOpenAI (compat)
-    if CEREBRAS_LANGCHAIN_OK and ChatCerebras is not None:
-        base_llm = ChatCerebras(
-            api_key=api_key,
-            model=model,
-            temperature=0.0,
-            max_tokens=8192,
-        )
-    elif LANGCHAIN_OK and ChatOpenAI is not None:
-        base_llm = ChatOpenAI(
-            base_url=CEREBRAS_BASE,
-            api_key=api_key,
-            model=model,
-            temperature=0.0,
-            max_tokens=8192,
-            timeout=120,
-            max_retries=2,
-        )
-    else:
-        return None
-
-    class _Wrapper:
-        """Thin wrapper around the base LLM that replaces with_structured_output."""
-
-        def __init__(self, llm):
-            self._llm = llm
-
-        # ── Forward everything the agent might call to the underlying LLM ──
-        def __getattr__(self, name):
-            return getattr(self._llm, name)
-
-        def with_structured_output(self, schema, *, include_raw: bool = False, **kwargs):
-            """
-            JSON-mode structured output.  Ignores tool/function-calling; instead:
-              - Adds the JSON schema as an instruction in the last system message (or inserts one)
-              - Calls the LLM with ainvoke
-              - Extracts and parses the JSON from the response
-              - Returns {"raw", "parsed", "parsing_error"} if include_raw else the parsed object
-            """
+    def _make_wso_method(get_self):
+        """Create a with_structured_output method that captures the self reference lazily."""
+        def _wso(self_ref, schema, *, include_raw: bool = False, **kwargs):
             try:
                 if hasattr(schema, 'model_json_schema'):
                     json_schema = json.dumps(schema.model_json_schema(), indent=2)
@@ -145,58 +109,98 @@ def make_cerebras_llm(api_key: str, model: str):
                 json_schema = str(schema)
 
             FORMAT_INSTRUCTION = (
-                "\n\n## IMPORTANT: Respond with ONLY a single valid JSON object.\n"
-                "No markdown, no code blocks, no explanation — raw JSON only.\n"
-                f"The JSON must conform to this schema:\n{json_schema}"
+                "\n\n## CRITICAL INSTRUCTION: Your entire response must be a single valid JSON object.\n"
+                "Do NOT include any markdown, code fences, explanation, or extra text.\n"
+                "Output ONLY the JSON object (starting with { and ending with }).\n"
+                "The JSON must conform to this schema:\n"
+                f"{json_schema}"
             )
 
-            llm_ref = self._llm
+            llm_ref = self_ref
 
             async def _invoke(messages):
-                # Inject JSON instruction into the first human or system message
                 msgs = list(messages) if not isinstance(messages, list) else messages
                 injected = False
                 new_msgs = []
                 for m in msgs:
-                    if not injected and hasattr(m, "type") and m.type in ("system", "human"):
+                    if not injected and hasattr(m, "type") and m.type == "system":
                         content = m.content if isinstance(m.content, str) else str(m.content)
                         new_msgs.append(type(m)(content=content + FORMAT_INSTRUCTION))
                         injected = True
                     else:
                         new_msgs.append(m)
                 if not injected:
-                    new_msgs = [SystemMessage(content="You are a helpful AI." + FORMAT_INSTRUCTION)] + msgs
+                    new_msgs = [SystemMessage(content="You are a browser automation AI." + FORMAT_INSTRUCTION)] + msgs
 
                 raw_response = await llm_ref.ainvoke(new_msgs)
                 content = raw_response.content if hasattr(raw_response, "content") else str(raw_response)
 
-                # Extract JSON from the response (handle markdown code blocks)
                 json_str = content.strip()
-                # Strip ```json ... ``` or ``` ... ```
-                json_str = re.sub(r'^```(?:json)?\s*', '', json_str)
-                json_str = re.sub(r'\s*```$', '', json_str)
+                json_str = re.sub(r'^```(?:json)?\s*', '', json_str, flags=re.MULTILINE)
+                json_str = re.sub(r'\s*```\s*$', '', json_str, flags=re.MULTILINE)
                 json_str = json_str.strip()
 
                 parsed = None
                 parsing_error = None
                 try:
                     data = json.loads(json_str)
-                    # Attempt to construct the Pydantic model
-                    if pydantic.VERSION.startswith("2."):
+                    if _pydantic.VERSION.startswith("2."):
                         parsed = schema.model_validate(data)
                     else:
                         parsed = schema(**data)
                 except Exception as e:
                     parsing_error = str(e)
-                    print(f"[LLM] Structured output parse error: {e} | content[:200]={content[:200]}", flush=True)
+                    print(f"[LLM] JSON parse error: {e!r} | raw_len={len(content)} | start={content[:200]!r}", flush=True)
 
                 if include_raw:
                     return {"raw": raw_response, "parsed": parsed, "parsing_error": parsing_error}
                 return parsed
 
             return RunnableLambda(_invoke)
+        return _wso
 
-    return _Wrapper(base_llm)
+    # ── Subclass ChatCerebras (preferred: it's a proper BaseChatModel) ─────────
+    if CEREBRAS_LANGCHAIN_OK and ChatCerebras is not None:
+        try:
+            _wso_fn = _make_wso_method(None)
+
+            class _CerebrasJSONMode(ChatCerebras):
+                """ChatCerebras subclass — overrides with_structured_output for JSON mode."""
+                def with_structured_output(self, schema, *, include_raw=False, **kwargs):
+                    return _wso_fn(self, schema, include_raw=include_raw, **kwargs)
+
+            return _CerebrasJSONMode(
+                api_key=api_key,
+                model=model,
+                temperature=0.0,
+                max_tokens=8192,
+            )
+        except Exception as e:
+            print(f"[Cerebras] ChatCerebras subclass failed: {e}", flush=True)
+
+    # ── Fallback: ChatOpenAI subclass (Cerebras-compatible base_url) ───────────
+    if LANGCHAIN_OK and ChatOpenAI is not None:
+        try:
+            _wso_fn = _make_wso_method(None)
+
+            class _OpenAIJSONMode(ChatOpenAI):
+                """ChatOpenAI subclass (Cerebras backend) — JSON-mode structured output."""
+                def with_structured_output(self, schema, *, include_raw=False, **kwargs):
+                    return _wso_fn(self, schema, include_raw=include_raw, **kwargs)
+
+            return _OpenAIJSONMode(
+                base_url=CEREBRAS_BASE,
+                api_key=api_key,
+                model=model,
+                temperature=0.0,
+                max_tokens=8192,
+                timeout=120,
+                max_retries=2,
+            )
+        except Exception as e:
+            print(f"[Cerebras] OpenAI fallback subclass failed: {e}", flush=True)
+
+    return None
 
 # ── Config ─────────────────────────────────────────────────────────────────────
 SUPABASE_URL     = os.environ.get("SUPABASE_URL", "")
