@@ -267,8 +267,12 @@ async def handle_captcha(page, task_id: str, supabase=None, nopecha_key: str = "
 
 
 # ── Page Context Gatherer ─────────────────────────────────────────────────────
-async def get_page_context(page, prompt: str, memory: List[str]) -> str:
+async def get_page_context(page, prompt: str, memory: List[str],
+                           completed_extracts: List[str] = None,
+                           last_extract_url: str = "") -> str:
     """Build rich page context for Cerebras decision making."""
+    if completed_extracts is None:
+        completed_extracts = []
     try:
         ctx = await page.evaluate("""() => {
             const getText = (el) => el ? (el.innerText || el.textContent || '').trim() : '';
@@ -302,18 +306,24 @@ async def get_page_context(page, prompt: str, memory: List[str]) -> str:
 
     mem_str = ""
     if memory:
-        mem_str = "\nEXTRACTED SO FAR:\n" + "\n".join(f"  • {m}" for m in memory[-6:])
+        mem_str = "\nEXTRACTED SO FAR:\n" + "\n".join(f"  • {m[:200]}" for m in memory[-6:])
+
+    completed_str = ""
+    if completed_extracts:
+        completed_str = f"\nCOMPLETED STEPS: {', '.join(completed_extracts)} — these are DONE, do NOT re-extract them. Move to the NEXT step."
+
+    next_hint = ""
+    if completed_extracts and last_extract_url == ctx.get('url', ''):
+        next_hint = "\n⚡ IMPORTANT: You already collected data on this page. Your next action MUST be GOTO (navigate to the next URL in the task) or FINISH if all data is collected."
 
     return f"""URL: {ctx['url']}
 TITLE: {ctx['title']}
 HEADINGS: {' | '.join(ctx.get('headings', [])[:3])}
-PAGE TEXT (first 2000 chars):
-{ctx.get('bodyText', '')[:2000]}
-INPUTS: {json.dumps(ctx.get('inputs', [])[:8])}
-BUTTONS: {json.dumps(ctx.get('buttons', [])[:8])}
-LINKS: {json.dumps(ctx.get('links', [])[:8])}
-ERRORS: {' | '.join(ctx.get('errors', []))}
-TASK: {prompt}{mem_str}"""
+PAGE TEXT (first 1500 chars):
+{ctx.get('bodyText', '')[:1500]}
+INPUTS: {json.dumps(ctx.get('inputs', [])[:6])}
+LINKS: {json.dumps(ctx.get('links', [])[:6])}
+TASK: {prompt}{completed_str}{mem_str}{next_hint}"""
 
 
 # ── Bulletproof JSON Extractor ────────────────────────────────────────────────
@@ -451,6 +461,8 @@ async def run_agent(task_id: str, prompt: str, pool: Optional[CerebrasPool],
         # ── Agent Loop ───────────────────────────────────────────────────────
         recent_actions: List[str] = []   # loop detection buffer
         consecutive_waits = 0
+        completed_extracts: List[str] = []  # labels successfully extracted
+        last_extract_url: str = ""          # URL where last extract happened
 
         while steps_done < max_steps:
             steps_done += 1
@@ -480,7 +492,8 @@ async def run_agent(task_id: str, prompt: str, pool: Optional[CerebrasPool],
                 break
 
             # Build page context
-            page_ctx = await get_page_context(page, prompt, memory)
+            page_ctx = await get_page_context(page, prompt, memory,
+                                              completed_extracts, last_extract_url)
 
             # Ask Cerebras for next action
             action: Optional[dict] = None
@@ -639,8 +652,14 @@ CRITICAL RULES:
                     extracted_str = str(extracted)[:600] if extracted else "(empty — page may need more time to load)"
                     memory.append(f"{label}: {extracted_str}")
                     log(task_id, f"📊 Extracted [{label}]: {extracted_str[:250]}", "success", supabase)
+                    # Track completion so model knows to advance
+                    if label not in completed_extracts:
+                        completed_extracts.append(label)
+                    last_extract_url = page.url
                     # Reset consecutive waits on successful extract
                     consecutive_waits = 0
+                    # Reset recent_actions so loop detector doesn't fire prematurely
+                    recent_actions.clear()
                 except Exception as e:
                     log(task_id, f"Extract error ({js_expr[:60]}): {str(e)[:80]}", "warning", supabase)
                     # Fallback: get visible text
