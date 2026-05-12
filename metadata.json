@@ -1,0 +1,16 @@
+{
+  "name": "AutoAgent Pro",
+  "description": "An autonomous browser agent platform for complex web automation, featuring AI reasoning, scheduled tasks, and live dashboard monitoring.",
+  "requestFramePermissions": [
+    "camera",
+    "microphone",
+    "geolocation"
+  ],
+  "majorCapabilities": [
+    "Autonomous Browser Navigation",
+    "AI-Powered Reasoning",
+    "Task Scheduling",
+    "CAPTCHA Solving",
+    "Cloud Integration"
+  ]
+}
