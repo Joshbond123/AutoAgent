@@ -68,9 +68,8 @@ NOPECHA_KEY      = os.environ.get("NOPECHA_API_KEY", "")
 CEREBRAS_BASE    = "https://api.cerebras.ai/v1"
 
 CEREBRAS_MODELS = [
-    "llama3.1-8b",          # fastest, cheapest — try first
-    "llama-3.3-70b",        # smarter
-    "gpt-oss-120b",         # most capable
+    "llama-3.3-70b",        # primary — best tool/structured-output support
+    "llama3.1-8b",          # last resort — weak tool calling, may loop
 ]
 
 CF_ACCOUNT_ID_ENV = os.environ.get("CLOUDFLARE_ACCOUNT_ID", "")
@@ -294,31 +293,29 @@ async def run_browser_use_agent(
     llm_label = ""
 
     if cerebras_pool and LANGCHAIN_OK:
-        for model in CEREBRAS_MODELS:
-            key = cerebras_pool.next_key()
-            if not key:
-                break
-            try:
-                candidate = ChatOpenAI(
-                    base_url=CEREBRAS_BASE,
-                    api_key=key,
-                    model=model,
-                    temperature=0.0,
-                    max_tokens=4096,
-                    timeout=60,
-                    max_retries=1,
-                )
-                # Quick connectivity test
-                test = candidate.invoke("Reply with OK")
-                if test:
+        key = cerebras_pool.next_key()
+        if key:
+            # Try models in priority order — llama-3.3-70b FIRST (proper tool-call support)
+            for model in CEREBRAS_MODELS:
+                try:
+                    candidate = ChatOpenAI(
+                        base_url=CEREBRAS_BASE,
+                        api_key=key,
+                        model=model,
+                        temperature=0.0,
+                        max_tokens=8192,
+                        timeout=120,
+                        max_retries=2,
+                    )
+                    # No pre-flight invoke — just trust the model and let browser-use handle failures.
+                    # The invoke test doesn't check structured-output compatibility and wastes time.
                     llm = candidate
                     llm_label = f"Cerebras {model}"
                     log(task_id, f"⚡ Cerebras LLM ready: {model}", "info", supabase)
                     break
-            except Exception as e:
-                print(f"[Cerebras] {model} test failed: {e}", flush=True)
-                cerebras_pool.mark_failed(key)
-                continue
+                except Exception as e:
+                    print(f"[Cerebras] {model} init failed: {e}", flush=True)
+                    continue
 
     if llm is None and cf_account_id and cf_api_key and LANGCHAIN_OK:
         try:
@@ -424,14 +421,18 @@ async def run_browser_use_agent(
     try:
         log(task_id, "🚀 Launching browser-use agent…", "info", supabase)
 
+        async def combined_step_cb(state: Any, output: Any, step_num: int):
+            await on_step_start(state, output, step_num)
+            await on_step_end(state, output, step_num)
+
         agent = Agent(
             task=prompt,
             llm=llm,
             browser=browser,
-            register_new_step_callback=on_step_start,
+            register_new_step_callback=combined_step_cb,
             register_done_callback=None,
-            max_failures=5,
-            retry_delay=5,
+            max_failures=3,
+            retry_delay=3,
         )
 
         # Capture browser session reference for screenshots
@@ -439,17 +440,6 @@ async def run_browser_use_agent(
             browser_holder[0] = agent.browser
         elif hasattr(agent, "_browser"):
             browser_holder[0] = agent._browser
-
-        # Wire step-end callback if supported
-        try:
-            if hasattr(agent, "register_new_step_callback"):
-                original_cb = agent.register_new_step_callback
-                async def combined_cb(state, output, step_num):
-                    await on_step_start(state, output, step_num)
-                    await on_step_end(state, output, step_num)
-                agent.register_new_step_callback = combined_cb
-        except Exception:
-            pass
 
         # Run with a generous step limit
         history = await agent.run(max_steps=50)
