@@ -50,8 +50,13 @@
   --ring: #3b82f6;
 }
 
-* {
+*, *::before, *::after {
   box-sizing: border-box;
+}
+
+html {
+  -webkit-text-size-adjust: 100%;
+  text-size-adjust: 100%;
 }
 
 html, body {
@@ -59,39 +64,61 @@ html, body {
   padding: 0;
   height: 100%;
   overflow: hidden;
+  -webkit-tap-highlight-color: transparent;
 }
 
 #root {
   height: 100vh;
+  height: 100dvh;
   display: flex;
   flex-direction: column;
 }
 
-/* Custom scrollbar */
-::-webkit-scrollbar { width: 6px; height: 6px; }
-::-webkit-scrollbar-track { background: #0f172a; }
-::-webkit-scrollbar-thumb { background: #334155; border-radius: 3px; }
-::-webkit-scrollbar-thumb:hover { background: #475569; }
+/* Touch targets — minimum 44px */
+.touch-manipulation {
+  touch-action: manipulation;
+  -webkit-tap-highlight-color: transparent;
+}
 
-/* Smooth animations */
-* { transition-property: color, background-color, border-color, box-shadow; transition-duration: 150ms; }
+/* Safe area insets for notched devices */
+.safe-area-pb {
+  padding-bottom: env(safe-area-inset-bottom, 0px);
+}
+
+/* Custom scrollbar (desktop only) */
+@media (pointer: fine) {
+  ::-webkit-scrollbar { width: 5px; height: 5px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+  ::-webkit-scrollbar-thumb { background: #334155; border-radius: 3px; }
+  ::-webkit-scrollbar-thumb:hover { background: #475569; }
+}
+
+/* Smooth color transitions */
+* {
+  transition-property: color, background-color, border-color, box-shadow, opacity;
+  transition-duration: 150ms;
+}
+
+/* Exclude transition on animated elements */
+.animate-spin, .animate-bounce, .animate-pulse {
+  transition: none;
+}
 
 /* Animations */
 @keyframes pulse-glow {
   0%, 100% { box-shadow: 0 0 0 0 rgba(59, 130, 246, 0.4); }
-  50% { box-shadow: 0 0 0 8px rgba(59, 130, 246, 0); }
+  50%       { box-shadow: 0 0 0 8px rgba(59, 130, 246, 0); }
 }
-
 .animate-pulse-glow { animation: pulse-glow 2s infinite; }
-
-@keyframes slide-in {
-  from { transform: translateX(-100%); opacity: 0; }
-  to { transform: translateX(0); opacity: 1; }
-}
 
 @keyframes fade-in-up {
   from { transform: translateY(20px); opacity: 0; }
-  to { transform: translateY(0); opacity: 1; }
+  to   { transform: translateY(0);    opacity: 1; }
 }
-
 .animate-fade-in-up { animation: fade-in-up 0.4s ease-out; }
+
+/* Prevent text overflow everywhere */
+p, span, h1, h2, h3, h4, h5 {
+  overflow-wrap: break-word;
+  word-break: break-word;
+}
