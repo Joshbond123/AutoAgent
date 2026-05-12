@@ -29,13 +29,30 @@ except ImportError:
     print("[WARN] supabase not installed — logs will go to stdout only", flush=True)
 
 try:
-    from browser_use import Agent, Browser, BrowserConfig
-    from browser_use.browser.context import BrowserContextConfig
+    from browser_use import Agent
+    # Browser/BrowserConfig location varies by version
+    try:
+        from browser_use import Browser, BrowserConfig
+    except ImportError:
+        try:
+            from browser_use.browser.browser import Browser, BrowserConfig
+        except ImportError:
+            Browser = None
+            BrowserConfig = None
+    # BrowserContextConfig may not exist in all versions
+    try:
+        from browser_use.browser.context import BrowserContextConfig
+    except ImportError:
+        BrowserContextConfig = None
     BROWSER_USE_OK = True
 except ImportError as _e:
     BROWSER_USE_OK = False
+    Agent = None
+    Browser = None
+    BrowserConfig = None
+    BrowserContextConfig = None
     print(f"[ERROR] browser-use not installed: {_e}", flush=True)
-    print("[ERROR] Run: pip install browser-use langchain-openai", flush=True)
+    print("[ERROR] Run: pip install browser-use==0.1.40 langchain-openai", flush=True)
 
 try:
     from langchain_openai import ChatOpenAI
