@@ -509,22 +509,23 @@ async def run_agent(task_id: str, prompt: str, pool: Optional[CerebrasPool],
                     system_prompt = f"""You are AutoAgent Pro, an autonomous web browsing AI.
 Output ONLY a single JSON object. No markdown. No explanation. Just the JSON.
 
-ACTIONS (pick ONE):
-{{"action":"GOTO","url":"https://example.com","reason":"why"}}
-{{"action":"CLICK","selector":"a.link","reason":"why"}}
-{{"action":"TYPE","selector":"#search","text":"query","reason":"why"}}
+ACTIONS (pick ONE — include ALL required fields):
+{{"action":"GOTO","url":"https://example.com","reason":"why"}}          <- url is REQUIRED
+{{"action":"CLICK","selector":"a.link","reason":"why"}}                  <- selector is REQUIRED
+{{"action":"TYPE","selector":"#search","text":"query","reason":"why"}}   <- selector+text REQUIRED
 {{"action":"PRESS_KEY","key":"Enter","reason":"why"}}
 {{"action":"SCROLL","scrollY":500,"reason":"why"}}
-{{"action":"EXTRACT","js":"document.querySelector('h1').innerText","label":"title","reason":"why"}}
+{{"action":"EXTRACT","js":"document.body.innerText","label":"name","reason":"why"}} <- js+label REQUIRED
 {{"action":"WAIT","ms":2000,"reason":"why"}}
-{{"action":"FINISH","summary":"all extracted data here","reason":"done"}}
+{{"action":"FINISH","summary":"full summary of all data collected","reason":"done"}}
 
 CRITICAL RULES:
 - Output ONLY valid JSON starting with {{ ending with }}
-- Use double quotes for all strings
-- Use EXTRACT to read page content (not CLICK)
-- Use FINISH when data is extracted or task complete
-- Do NOT repeat an action you just did unless URL changed{loop_hint}"""
+- Use DOUBLE QUOTES for all strings — never single quotes
+- GOTO MUST include the full "url" field — e.g. "url":"https://httpbin.org/ip"
+- EXTRACT MUST include "js" field (JavaScript expression) and "label" field
+- After extracting data from a page, GOTO the next URL immediately — do NOT re-extract
+- Use FINISH when ALL required data is collected{loop_hint}"""
 
                     response = await cerebras_chat(
                         pool,
@@ -564,6 +565,14 @@ CRITICAL RULES:
 
             elif action_type == "GOTO":
                 target_url = action.get("url", "")
+                # Fallback: if model forgot the url field, extract next unvisited URL from prompt
+                if not target_url:
+                    all_urls = re.findall(r'https?://[^\s\'"<>)]+', prompt)
+                    current = page.url.rstrip('/')
+                    unvisited = [u for u in all_urls if u.rstrip('/') != current]
+                    if unvisited:
+                        target_url = unvisited[0]
+                        log(task_id, f"⚠️ GOTO missing url — auto-selected next: {target_url[:60]}", "warning", supabase)
                 if target_url:
                     try:
                         log(task_id, f"🌐 Navigating to {target_url[:80]}", "info", supabase)
@@ -571,8 +580,12 @@ CRITICAL RULES:
                         await asyncio.sleep(random.uniform(0.9, 2.1))
                         await handle_captcha(page, task_id, supabase, NOPECHA_KEY)
                         await upload_screenshot(page, task_id, steps_done, f"Navigated to {target_url[:40]}", supabase)
+                        # Reset action tracker so loop detector doesn't fire on valid navigation
+                        recent_actions.clear()
                     except Exception as e:
                         log(task_id, f"Navigation error: {str(e)[:100]}", "warning", supabase)
+                else:
+                    log(task_id, "⚠️ GOTO action has no url and no URLs found in prompt", "warning", supabase)
 
             elif action_type == "CLICK":
                 selector = action.get("selector", "")
