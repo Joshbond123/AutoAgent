@@ -463,6 +463,7 @@ async def run_agent(task_id: str, prompt: str, pool: Optional[CerebrasPool],
         consecutive_waits = 0
         completed_extracts: List[str] = []  # labels successfully extracted
         last_extract_url: str = ""          # URL where last extract happened
+        extracted_urls: List[str] = []      # URLs where data was successfully extracted
 
         while steps_done < max_steps:
             steps_done += 1
@@ -565,14 +566,20 @@ CRITICAL RULES:
 
             elif action_type == "GOTO":
                 target_url = action.get("url", "")
-                # Fallback: if model forgot the url field, extract next unvisited URL from prompt
+                # Fallback: if model forgot the url field, extract next unextracted URL from prompt
                 if not target_url:
                     all_urls = re.findall(r'https?://[^\s\'"<>)]+', prompt)
                     current = page.url.rstrip('/')
-                    unvisited = [u for u in all_urls if u.rstrip('/') != current]
-                    if unvisited:
-                        target_url = unvisited[0]
-                        log(task_id, f"⚠️ GOTO missing url — auto-selected next: {target_url[:60]}", "warning", supabase)
+                    # Priority 1: URLs not yet extracted at all
+                    unextracted = [u for u in all_urls
+                                   if u.rstrip('/') not in extracted_urls
+                                   and u.rstrip('/') != current]
+                    # Priority 2: any URL different from current
+                    different = [u for u in all_urls if u.rstrip('/') != current]
+                    chosen = (unextracted or different or [None])[0]
+                    if chosen:
+                        target_url = chosen
+                        log(task_id, f"⚠️ GOTO missing url — auto-selected: {target_url[:60]}", "warning", supabase)
                 if target_url:
                     try:
                         log(task_id, f"🌐 Navigating to {target_url[:80]}", "info", supabase)
@@ -669,6 +676,9 @@ CRITICAL RULES:
                     if label not in completed_extracts:
                         completed_extracts.append(label)
                     last_extract_url = page.url
+                    cur = page.url.rstrip('/')
+                    if cur not in extracted_urls:
+                        extracted_urls.append(cur)
                     # Reset consecutive waits on successful extract
                     consecutive_waits = 0
                     # Reset recent_actions so loop detector doesn't fire prematurely
