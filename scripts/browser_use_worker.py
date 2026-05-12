@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-AutoAgent Pro — Browser-Use Worker v5
+AutoAgent Pro — Browser-Use Worker v6
 Uses the browser-use library for AI-controlled browser automation.
-Primary LLM:  Cerebras (via LangChain OpenAI-compatible wrapper)
+Primary LLM:  Cerebras via langchain-cerebras (ChatCerebras — native structured-output support)
 Fallback LLM: Cloudflare Workers AI text model
 Browser:      browser-use (built on Playwright, stealth, headless)
 Screenshots:  Streamed to Supabase task_logs in real-time
@@ -55,10 +55,19 @@ except ImportError as _e:
     print("[ERROR] Run: pip install browser-use==0.1.40 langchain-openai", flush=True)
 
 try:
+    from langchain_cerebras import ChatCerebras
+    CEREBRAS_LANGCHAIN_OK = True
+except ImportError:
+    CEREBRAS_LANGCHAIN_OK = False
+    ChatCerebras = None
+    print("[WARN] langchain-cerebras not installed — falling back to langchain-openai", flush=True)
+
+try:
     from langchain_openai import ChatOpenAI
     LANGCHAIN_OK = True
 except ImportError:
     LANGCHAIN_OK = False
+    ChatOpenAI = None
     print("[WARN] langchain-openai not installed", flush=True)
 
 # ── Config ─────────────────────────────────────────────────────────────────────
@@ -67,9 +76,10 @@ SUPABASE_SVC_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "")
 NOPECHA_KEY      = os.environ.get("NOPECHA_API_KEY", "")
 CEREBRAS_BASE    = "https://api.cerebras.ai/v1"
 
+# llama-3.3-70b first — it has the best structured-output / tool-call support
 CEREBRAS_MODELS = [
-    "llama-3.3-70b",        # primary — best tool/structured-output support
-    "llama3.1-8b",          # last resort — weak tool calling, may loop
+    "llama-3.3-70b",
+    "llama3.1-8b",
 ]
 
 CF_ACCOUNT_ID_ENV = os.environ.get("CLOUDFLARE_ACCOUNT_ID", "")
@@ -292,25 +302,35 @@ async def run_browser_use_agent(
     llm = None
     llm_label = ""
 
-    if cerebras_pool and LANGCHAIN_OK:
+    if cerebras_pool and (CEREBRAS_LANGCHAIN_OK or LANGCHAIN_OK):
         key = cerebras_pool.next_key()
         if key:
-            # Try models in priority order — llama-3.3-70b FIRST (proper tool-call support)
+            # Try models in priority order — llama-3.3-70b FIRST (best tool-call support)
             for model in CEREBRAS_MODELS:
                 try:
-                    candidate = ChatOpenAI(
-                        base_url=CEREBRAS_BASE,
-                        api_key=key,
-                        model=model,
-                        temperature=0.0,
-                        max_tokens=8192,
-                        timeout=120,
-                        max_retries=2,
-                    )
-                    # No pre-flight invoke — just trust the model and let browser-use handle failures.
-                    # The invoke test doesn't check structured-output compatibility and wastes time.
+                    if CEREBRAS_LANGCHAIN_OK and ChatCerebras is not None:
+                        # Preferred: langchain-cerebras ChatCerebras — natively handles
+                        # browser-use's with_structured_output() calls correctly.
+                        candidate = ChatCerebras(
+                            api_key=key,
+                            model=model,
+                            temperature=0.0,
+                            max_tokens=8192,
+                        )
+                        llm_label = f"Cerebras {model} (ChatCerebras)"
+                    else:
+                        # Fallback: OpenAI-compatible wrapper (may loop on Step 1)
+                        candidate = ChatOpenAI(
+                            base_url=CEREBRAS_BASE,
+                            api_key=key,
+                            model=model,
+                            temperature=0.0,
+                            max_tokens=8192,
+                            timeout=120,
+                            max_retries=2,
+                        )
+                        llm_label = f"Cerebras {model} (ChatOpenAI)"
                     llm = candidate
-                    llm_label = f"Cerebras {model}"
                     log(task_id, f"⚡ Cerebras LLM ready: {model}", "info", supabase)
                     break
                 except Exception as e:
