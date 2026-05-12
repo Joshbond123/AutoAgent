@@ -62,29 +62,98 @@ class CerebrasPool:
 
 
 # ── Cloudflare AI Pool ─────────────────────────────────────────────────────────
-class CloudflarePool:
-    def __init__(self, account_id: str, keys: List[str], model: str):
-        self.account_id = account_id
-        self.keys       = [k.strip() for k in keys if k.strip()]
-        self.model      = model or "@cf/moonshotai/kimi-k2.6"
-        self.idx        = 0
-        self.failed: set = set()
+import json as _json
 
-    def next_key(self) -> Optional[str]:
-        avail = [k for k in self.keys if k not in self.failed]
+class CFCredential:
+    """A single Cloudflare account credential."""
+    def __init__(self, account_id: str, api_key: str, model: str, label: str = ""):
+        self.account_id = account_id.strip()
+        self.api_key    = api_key.strip()
+        self.model      = (model or "@cf/moonshotai/kimi-k2.6").strip()
+        self.label      = label or "Account"
+
+    def __repr__(self):
+        return f"CFCredential({self.label}, acct={self.account_id[:12]}…)"
+
+
+class CloudflarePool:
+    """
+    Multi-account Cloudflare pool.
+    Accepts credential list parsed from the new JSON format in cloudflare_keys[],
+    or falls back to the legacy single-account format.
+    """
+    def __init__(self, credentials: List["CFCredential"], default_model: str = ""):
+        self.credentials = [c for c in credentials if c.account_id and c.api_key]
+        self.default_model = default_model or "@cf/moonshotai/kimi-k2.6"
+        self.idx    = 0
+        self.failed: set = set()  # set of (account_id, api_key) tuples
+
+    def next_credential(self) -> Optional["CFCredential"]:
+        avail = [c for c in self.credentials if (c.account_id, c.api_key) not in self.failed]
         if not avail:
             self.failed.clear()
-            avail = self.keys
+            avail = self.credentials
         if not avail:
             return None
-        key = avail[self.idx % len(avail)]
+        cred = avail[self.idx % len(avail)]
         self.idx = (self.idx + 1) % len(avail)
-        return key
+        return cred
+
+    def mark_failed(self, cred: "CFCredential"):
+        self.failed.add((cred.account_id, cred.api_key))
+        print(f"[Cloudflare] Credential failed: {cred.label} — rotating to next", flush=True)
 
     @property
-    def ready(self): return bool(self.account_id and self.keys)
+    def ready(self): return len(self.credentials) > 0
     @property
-    def size(self): return len(self.keys)
+    def size(self): return len(self.credentials)
+
+    # Legacy compat: next_key() → returns api_key of next credential
+    def next_key(self) -> Optional[str]:
+        c = self.next_credential()
+        return c.api_key if c else None
+
+    # Legacy compat: account_id → first credential
+    @property
+    def account_id(self) -> str:
+        return self.credentials[0].account_id if self.credentials else ""
+
+    @property
+    def model(self) -> str:
+        return self.credentials[0].model if self.credentials else self.default_model
+
+
+def parse_cf_credentials(raw_keys: List[str], fallback_account_id: str = "",
+                          fallback_model: str = "") -> List[CFCredential]:
+    """Parse cloudflare_keys[] which may contain JSON credential objects or plain API keys."""
+    creds = []
+    for item in (raw_keys or []):
+        item = item.strip()
+        if not item:
+            continue
+        try:
+            obj = _json.loads(item)
+            if isinstance(obj, dict) and obj.get("api_key"):
+                if not obj.get("enabled", True):
+                    continue  # skip disabled credentials
+                creds.append(CFCredential(
+                    account_id = obj.get("account_id", fallback_account_id),
+                    api_key    = obj["api_key"],
+                    model      = obj.get("model", fallback_model) or fallback_model,
+                    label      = obj.get("label", "Account"),
+                ))
+                continue
+        except Exception:
+            pass
+        # Legacy: plain API key string — use fallback account_id
+        if fallback_account_id:
+            creds.append(CFCredential(
+                account_id = fallback_account_id,
+                api_key    = item,
+                model      = fallback_model or "@cf/moonshotai/kimi-k2.6",
+                label      = "Legacy Key",
+            ))
+    return creds
 
 
 async def cerebras_chat(pool: CerebrasPool, messages: list,
@@ -121,15 +190,16 @@ async def cerebras_chat(pool: CerebrasPool, messages: list,
 
 
 async def cloudflare_vision(cf: CloudflarePool, screenshot_b64: str, prompt_text: str) -> Optional[str]:
-    """Send screenshot + prompt to Cloudflare vision model, return text response."""
+    """Send screenshot + prompt to Cloudflare vision model. Rotates on failure."""
     if not cf.ready:
         return None
-    key = cf.next_key()
-    if not key:
+    cred = cf.next_credential()
+    if not cred:
         return None
-    url = f"https://api.cloudflare.com/client/v4/accounts/{cf.account_id}/ai/run/{cf.model}"
-    hdrs = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
-    body = {
+    model = cred.model or cf.default_model
+    url   = f"https://api.cloudflare.com/client/v4/accounts/{cred.account_id}/ai/run/{model}"
+    hdrs  = {"Authorization": f"Bearer {cred.api_key}", "Content-Type": "application/json"}
+    body  = {
         "messages": [{
             "role": "user",
             "content": [
@@ -141,37 +211,40 @@ async def cloudflare_vision(cf: CloudflarePool, screenshot_b64: str, prompt_text
     try:
         async with httpx.AsyncClient(timeout=60) as c:
             r = await c.post(url, headers=hdrs, json=body)
-        if r.status_code == 429:
-            cf.failed.add(key)
+        if r.status_code in (429, 403, 401):
+            cf.mark_failed(cred)
             return None
         r.raise_for_status()
         data = r.json()
         return data.get("result", {}).get("response", "")
     except Exception as e:
-        print(f"[Cloudflare] Vision error: {e}", flush=True)
+        print(f"[Cloudflare] Vision error ({cred.label}): {e}", flush=True)
+        cf.mark_failed(cred)
         return None
 
 
 async def cloudflare_text(cf: CloudflarePool, messages: list, system: str = "") -> Optional[str]:
-    """Call Cloudflare AI with text-only messages (fallback when Cerebras fails)."""
+    """Call Cloudflare AI text-only. Rotates on failure."""
     if not cf.ready:
         return None
-    key = cf.next_key()
-    if not key:
+    cred = cf.next_credential()
+    if not cred:
         return None
-    url = f"https://api.cloudflare.com/client/v4/accounts/{cf.account_id}/ai/run/{cf.model}"
-    hdrs = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
-    msgs = ([{"role": "system", "content": system}] if system else []) + messages
+    model = cred.model or cf.default_model
+    url   = f"https://api.cloudflare.com/client/v4/accounts/{cred.account_id}/ai/run/{model}"
+    hdrs  = {"Authorization": f"Bearer {cred.api_key}", "Content-Type": "application/json"}
+    msgs  = ([{"role": "system", "content": system}] if system else []) + messages
     try:
         async with httpx.AsyncClient(timeout=60) as c:
             r = await c.post(url, headers=hdrs, json={"messages": msgs})
-        if r.status_code == 429:
-            cf.failed.add(key)
+        if r.status_code in (429, 403, 401):
+            cf.mark_failed(cred)
             return None
         r.raise_for_status()
         return r.json().get("result", {}).get("response", "")
     except Exception as e:
-        print(f"[Cloudflare] Text error: {e}", flush=True)
+        print(f"[Cloudflare] Text error ({cred.label}): {e}", flush=True)
+        cf.mark_failed(cred)
         return None
 
 
@@ -723,12 +796,14 @@ async def run_task(task_id: str):
     cerebras_keys = list(dict.fromkeys(cerebras_keys))
 
     cerebras_pool = CerebrasPool(cerebras_keys) if cerebras_keys else None
-    cf_pool       = CloudflarePool(cf_account_id, cf_keys, cf_model) if (cf_account_id and cf_keys) else None
+    cf_credentials = parse_cf_credentials(cf_keys, cf_account_id, cf_model)
+    cf_pool        = CloudflarePool(cf_credentials, cf_model) if cf_credentials else None
 
     if cerebras_pool:
         print(f"[Cerebras] Pool ready: {cerebras_pool.size} key(s)", flush=True)
     if cf_pool and cf_pool.ready:
-        print(f"[Cloudflare] Pool ready: {cf_pool.size} key(s), model: {cf_pool.model}", flush=True)
+        models = list(set(c.model for c in cf_pool.credentials))
+        print(f"[Cloudflare] Pool ready: {cf_pool.size} credential(s), models: {', '.join(models[:3])}", flush=True)
     if not cerebras_pool and (not cf_pool or not cf_pool.ready):
         print("[WARN] No AI providers configured — agent will use WAIT fallback", flush=True)
 

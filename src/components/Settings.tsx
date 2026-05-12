@@ -1,227 +1,576 @@
-import { useState, useEffect } from "react";
+/**
+ * AutoAgent Pro — Settings v3
+ * Multi-account Cloudflare credential manager, per-credential test/enable/disable,
+ * auto-rotation, Cerebras key pool, NopeCHA, GitHub PAT, system status.
+ * Credentials stored as JSON strings in cloudflare_keys[] array — no schema changes.
+ */
+import { useState, useEffect, useId } from "react";
 import { useSupabase } from "@/src/contexts/SupabaseContext";
 import { motion, AnimatePresence } from "motion/react";
+
+// ── Types ──────────────────────────────────────────────────────────────────────
+interface CFCredential {
+  id: string;
+  label: string;
+  account_id: string;
+  api_key: string;
+  model: string;
+  enabled: boolean;
+  test_status: "ok" | "fail" | "untested";
+  test_msg: string;
+  last_tested: string | null;
+}
 
 interface SettingsData {
   cerebras_keys: string[];
   nopecha_key: string;
+  cloudflare_credentials: CFCredential[];  // mapped from cloudflare_keys
+  cloudflare_model: string;                // default model
+  github_token: string;
+  // raw DB fields (kept for save)
   cloudflare_account_id: string;
   cloudflare_keys: string[];
-  cloudflare_model: string;
-  github_token: string;
 }
 
-const CLOUDFLARE_MODELS = [
-  { value: "@cf/moonshotai/kimi-k2.6", label: "Kimi K2.6 (Vision)" },
-  { value: "@cf/meta/llama-3.3-70b-instruct-fp8-fast", label: "Llama 3.3 70B Fast" },
-  { value: "@cf/google/gemma-3-12b-it", label: "Gemma 3 12B" },
-  { value: "@cf/qwen/qwq-32b", label: "Qwen QwQ 32B" },
+const CF_MODELS = [
+  { value: "@cf/moonshotai/kimi-k2.6",                     label: "Kimi K2.6 (Vision + Text)" },
+  { value: "@cf/meta/llama-3.3-70b-instruct-fp8-fast",     label: "Llama 3.3 70B (Fast)" },
+  { value: "@cf/qwen/qwq-32b",                              label: "Qwen QwQ 32B (Reasoning)" },
+  { value: "@cf/google/gemma-3-12b-it",                     label: "Gemma 3 12B" },
+  { value: "@cf/mistral/mistral-7b-instruct-v0.1",          label: "Mistral 7B" },
 ];
 
-function RevealableInput({ value, onChange, placeholder, type = "password" }: {
-  value: string; onChange: (v: string) => void; placeholder?: string; type?: string;
+function nanoid(n = 12): string {
+  return Array.from(crypto.getRandomValues(new Uint8Array(n)))
+    .map(b => b.toString(36).padStart(2, "0"))
+    .join("").slice(0, n);
+}
+
+// ── Serialise/deserialise credentials ──────────────────────────────────────────
+function parseCFCredentials(raw: string[]): CFCredential[] {
+  return (raw || []).map(item => {
+    try {
+      const parsed = JSON.parse(item);
+      if (parsed && typeof parsed === "object" && parsed.api_key) {
+        return {
+          id:          parsed.id          || nanoid(),
+          label:       parsed.label       || "Account",
+          account_id:  parsed.account_id  || "",
+          api_key:     parsed.api_key     || "",
+          model:       parsed.model       || "@cf/moonshotai/kimi-k2.6",
+          enabled:     parsed.enabled !== false,
+          test_status: parsed.test_status || "untested",
+          test_msg:    parsed.test_msg    || "",
+          last_tested: parsed.last_tested || null,
+        } as CFCredential;
+      }
+    } catch { /* old plain-key format */ }
+    // Legacy: plain API key — account_id unknown, must be filled in
+    return {
+      id:          nanoid(),
+      label:       "Legacy Key",
+      account_id:  "",
+      api_key:     item,
+      model:       "@cf/moonshotai/kimi-k2.6",
+      enabled:     true,
+      test_status: "untested" as const,
+      test_msg:    "",
+      last_tested: null,
+    };
+  });
+}
+
+function serialiseCFCredentials(creds: CFCredential[]): string[] {
+  return creds.map(c => JSON.stringify({
+    id:          c.id,
+    label:       c.label,
+    account_id:  c.account_id,
+    api_key:     c.api_key,
+    model:       c.model,
+    enabled:     c.enabled,
+    test_status: c.test_status,
+    test_msg:    c.test_msg,
+    last_tested: c.last_tested,
+  }));
+}
+
+// ── Sub-components ─────────────────────────────────────────────────────────────
+function RevealInput({ value, onChange, placeholder, mono = true }: {
+  value: string; onChange: (v: string) => void; placeholder?: string; mono?: boolean;
 }) {
   const [show, setShow] = useState(false);
   return (
     <div className="relative flex items-center">
       <input
-        type={show ? "text" : type}
+        type={show ? "text" : "password"}
         value={value}
         onChange={e => onChange(e.target.value)}
         placeholder={placeholder}
         autoComplete="off"
-        className="w-full bg-slate-800 border border-slate-700 rounded-xl px-4 py-2.5 pr-10 text-sm text-white placeholder-slate-500 focus:outline-none focus:border-blue-500 transition font-mono"
+        spellCheck={false}
+        className={`w-full bg-slate-800 border border-slate-700 rounded-xl px-4 py-2.5 pr-10 text-sm text-white placeholder-slate-500 focus:outline-none focus:border-blue-500 transition ${mono ? "font-mono" : ""}`}
       />
-      {type === "password" && (
-        <button type="button" onClick={() => setShow(s => !s)}
-          className="absolute right-3 text-slate-500 hover:text-slate-300 transition">
-          {show ? (
-            <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13.875 18.825A10.05 10.05 0 0112 19c-4.478 0-8.268-2.943-9.543-7a9.97 9.97 0 011.563-3.029m5.858.908a3 3 0 114.243 4.243M9.878 9.878l4.242 4.242M9.88 9.88l-3.29-3.29m7.532 7.532l3.29 3.29M3 3l3.59 3.59m0 0A9.953 9.953 0 0112 5c4.478 0 8.268 2.943 9.543 7a10.025 10.025 0 01-4.132 5.411m0 0L21 21" />
-            </svg>
-          ) : (
-            <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" /><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z" />
-            </svg>
-          )}
-        </button>
-      )}
+      <button type="button" onClick={() => setShow(s => !s)}
+        className="absolute right-3 text-slate-500 hover:text-slate-300 transition">
+        <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+          {show
+            ? <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13.875 18.825A10.05 10.05 0 0112 19c-4.478 0-8.268-2.943-9.543-7a9.97 9.97 0 011.563-3.029m5.858.908a3 3 0 114.243 4.243M9.878 9.878l4.242 4.242M9.88 9.88l-3.29-3.29m7.532 7.532l3.29 3.29M3 3l3.59 3.59m0 0A9.953 9.953 0 0112 5c4.478 0 8.268 2.943 9.543 7a10.025 10.025 0 01-4.132 5.411m0 0L21 21" />
+            : <><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" /><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z" /></>
+          }
+        </svg>
+      </button>
     </div>
   );
 }
 
-function KeyPool({ keys, onAdd, onRemove, placeholder, label }: {
+function CerebrasKeyPool({ keys, onAdd, onRemove }: {
   keys: string[]; onAdd: (k: string) => void; onRemove: (i: number) => void;
-  placeholder?: string; label?: string;
 }) {
-  const [newKey, setNewKey] = useState("");
+  const [draft, setDraft] = useState("");
   const add = () => {
-    const k = newKey.trim();
+    const k = draft.trim();
     if (!k || keys.includes(k)) return;
-    onAdd(k);
-    setNewKey("");
+    onAdd(k); setDraft("");
   };
   return (
     <div className="space-y-3">
-      <div className="space-y-2">
-        <AnimatePresence>
-          {keys.length === 0 ? (
-            <div className="text-center py-6 border border-dashed border-slate-800 rounded-xl">
-              <p className="text-sm text-slate-600">No {label || "keys"} added yet.</p>
+      <AnimatePresence>
+        {keys.length === 0 ? (
+          <motion.div key="empty" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}
+            className="text-center py-6 border border-dashed border-slate-800 rounded-xl">
+            <p className="text-sm text-slate-600">No Cerebras keys added yet.</p>
+          </motion.div>
+        ) : keys.map((k, i) => (
+          <motion.div key={k + i} initial={{ opacity: 0, height: 0 }} animate={{ opacity: 1, height: "auto" }}
+            exit={{ opacity: 0, height: 0 }} className="flex items-center gap-2">
+            <div className="flex-1 bg-slate-800 border border-slate-700 rounded-xl px-3 py-2.5 font-mono text-xs text-slate-300 truncate">
+              <span className="text-slate-500">{i + 1}.</span> {k.slice(0, 12)}{"•".repeat(18)}{k.slice(-6)}
             </div>
-          ) : keys.map((key, i) => (
-            <motion.div key={i} initial={{ opacity: 0, height: 0 }} animate={{ opacity: 1, height: "auto" }}
-              exit={{ opacity: 0, height: 0 }} className="flex items-center gap-2">
-              <div className="flex-1 bg-slate-800 border border-slate-700 rounded-xl px-3 py-2.5 font-mono text-xs text-slate-300 truncate">
-                {key.slice(0, 10)}{"•".repeat(20)}{key.slice(-6)}
-              </div>
-              <button onClick={() => onRemove(i)}
-                className="p-2 rounded-xl text-slate-600 hover:text-red-400 hover:bg-red-900/20 transition flex-shrink-0">
-                <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
-                </svg>
-              </button>
-            </motion.div>
-          ))}
-        </AnimatePresence>
-      </div>
+            <button onClick={() => onRemove(i)}
+              className="p-2 text-slate-600 hover:text-red-400 hover:bg-red-900/20 rounded-xl transition flex-shrink-0">
+              <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
+              </svg>
+            </button>
+          </motion.div>
+        ))}
+      </AnimatePresence>
       <div className="flex gap-2">
-        <input value={newKey} onChange={e => setNewKey(e.target.value)} onKeyDown={e => e.key === "Enter" && add()}
+        <input value={draft} onChange={e => setDraft(e.target.value)} onKeyDown={e => e.key === "Enter" && add()}
           type="password" autoComplete="off"
-          className="flex-1 bg-slate-800 border border-slate-700 rounded-xl px-3 py-2.5 text-sm text-white placeholder-slate-500 focus:outline-none focus:border-blue-500 transition font-mono"
-          placeholder={placeholder || "Enter key…"} />
-        <button onClick={add} disabled={!newKey.trim()}
-          className="bg-blue-600 hover:bg-blue-500 disabled:opacity-40 text-white px-4 py-2.5 rounded-xl text-sm font-bold transition">
-          Add
+          className="flex-1 bg-slate-800 border border-slate-700 rounded-xl px-3 py-2.5 text-sm text-white placeholder-slate-500 focus:outline-none focus:border-purple-500 transition font-mono"
+          placeholder="csk-…" />
+        <button onClick={add} disabled={!draft.trim()}
+          className="bg-purple-700 hover:bg-purple-600 disabled:opacity-40 text-white px-4 py-2.5 rounded-xl text-sm font-bold transition">
+          + Add
         </button>
       </div>
     </div>
   );
 }
 
+// ── Single CF Credential card ─────────────────────────────────────────────────
+function CFCredentialCard({
+  cred, index, onUpdate, onDelete, onTest,
+}: {
+  cred: CFCredential;
+  index: number;
+  onUpdate: (c: CFCredential) => void;
+  onDelete: () => void;
+  onTest: () => Promise<void>;
+}) {
+  const [expanded, setExpanded] = useState(false);
+  const [testing, setTesting] = useState(false);
+
+  const statusColors = {
+    ok:       "bg-green-900/30 text-green-400 border-green-800/30",
+    fail:     "bg-red-900/30 text-red-400 border-red-800/30",
+    untested: "bg-slate-800 text-slate-500 border-slate-700",
+  };
+
+  return (
+    <motion.div initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }}
+      className={`border rounded-2xl overflow-hidden transition ${
+        cred.enabled ? "border-slate-700 bg-slate-800/50" : "border-slate-800 bg-slate-900/40 opacity-60"
+      }`}>
+
+      {/* Header row */}
+      <div className="flex items-center gap-3 px-4 py-3">
+        {/* Status dot */}
+        <div className={`w-2 h-2 rounded-full flex-shrink-0 ${
+          cred.test_status === "ok" ? "bg-green-400" :
+          cred.test_status === "fail" ? "bg-red-400" : "bg-slate-600"
+        }`} />
+
+        {/* Label */}
+        <div className="flex-1 min-w-0">
+          <p className="text-sm font-semibold text-white truncate">{cred.label || `Account ${index + 1}`}</p>
+          <p className="text-[11px] text-slate-500 font-mono truncate">
+            {cred.account_id ? `ID: ${cred.account_id.slice(0, 12)}…` : "⚠ No Account ID"}
+            {" · "}
+            {cred.api_key ? `Key: ${cred.api_key.slice(0, 8)}…` : "⚠ No API Key"}
+          </p>
+        </div>
+
+        {/* Status badge */}
+        <span className={`text-[10px] font-bold px-2 py-0.5 rounded-full border flex-shrink-0 ${statusColors[cred.test_status]}`}>
+          {cred.test_status === "ok" ? "✓ OK" : cred.test_status === "fail" ? "✗ Fail" : "Untested"}
+        </span>
+
+        {/* Enable toggle */}
+        <button onClick={() => onUpdate({ ...cred, enabled: !cred.enabled })}
+          className={`relative w-9 h-5 rounded-full transition flex-shrink-0 ${cred.enabled ? "bg-blue-600" : "bg-slate-700"}`}>
+          <span className={`absolute top-0.5 w-4 h-4 rounded-full bg-white shadow transition-all ${cred.enabled ? "left-4" : "left-0.5"}`} />
+        </button>
+
+        {/* Expand */}
+        <button onClick={() => setExpanded(e => !e)}
+          className="text-slate-500 hover:text-white transition flex-shrink-0">
+          <svg className={`w-4 h-4 transition-transform ${expanded ? "rotate-180" : ""}`} fill="none" viewBox="0 0 24 24" stroke="currentColor">
+            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
+          </svg>
+        </button>
+      </div>
+
+      {/* Expanded edit form */}
+      <AnimatePresence>
+        {expanded && (
+          <motion.div initial={{ height: 0 }} animate={{ height: "auto" }} exit={{ height: 0 }}
+            className="overflow-hidden border-t border-slate-700/50">
+            <div className="px-4 py-4 space-y-3">
+
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                <div>
+                  <label className="block text-[11px] font-bold uppercase tracking-widest text-slate-500 mb-1">Label</label>
+                  <input value={cred.label} onChange={e => onUpdate({ ...cred, label: e.target.value })}
+                    placeholder="e.g. Main Account"
+                    className="w-full bg-slate-900 border border-slate-700 rounded-xl px-3 py-2.5 text-sm text-white placeholder-slate-600 focus:outline-none focus:border-blue-500 transition" />
+                </div>
+                <div>
+                  <label className="block text-[11px] font-bold uppercase tracking-widest text-slate-500 mb-1">AI Model</label>
+                  <select value={cred.model} onChange={e => onUpdate({ ...cred, model: e.target.value })}
+                    className="w-full bg-slate-900 border border-slate-700 rounded-xl px-3 py-2.5 text-sm text-white focus:outline-none focus:border-blue-500 transition">
+                    {CF_MODELS.map(m => <option key={m.value} value={m.value}>{m.label}</option>)}
+                  </select>
+                </div>
+              </div>
+
+              <div>
+                <label className="block text-[11px] font-bold uppercase tracking-widest text-slate-500 mb-1">Account ID</label>
+                <input value={cred.account_id} onChange={e => onUpdate({ ...cred, account_id: e.target.value })}
+                  placeholder="7d26fd976f99b5593254eb98cf594dd5"
+                  className="w-full bg-slate-900 border border-slate-700 rounded-xl px-3 py-2.5 text-sm text-white placeholder-slate-600 focus:outline-none focus:border-blue-500 transition font-mono" />
+              </div>
+
+              <div>
+                <label className="block text-[11px] font-bold uppercase tracking-widest text-slate-500 mb-1">API Key</label>
+                <RevealInput value={cred.api_key} onChange={v => onUpdate({ ...cred, api_key: v })}
+                  placeholder="cfut_…" />
+              </div>
+
+              {cred.test_msg && (
+                <p className={`text-xs rounded-xl px-3 py-2 border ${
+                  cred.test_status === "ok"
+                    ? "bg-green-900/10 border-green-800/30 text-green-400"
+                    : "bg-red-900/10 border-red-800/30 text-red-400"
+                }`}>
+                  {cred.test_status === "ok" ? "✓" : "✗"} {cred.test_msg}
+                </p>
+              )}
+
+              <div className="flex items-center gap-2 pt-1">
+                <button onClick={async () => { setTesting(true); await onTest(); setTesting(false); }}
+                  disabled={testing || !cred.account_id || !cred.api_key}
+                  className="flex items-center gap-1.5 bg-orange-600/20 hover:bg-orange-600/30 disabled:opacity-40 border border-orange-600/30 text-orange-300 px-4 py-2 rounded-xl text-xs font-bold transition">
+                  {testing
+                    ? <><div className="w-3 h-3 border-2 border-orange-400 border-t-transparent rounded-full animate-spin" /> Testing…</>
+                    : <>⚡ Test Connection</>
+                  }
+                </button>
+                <button onClick={onDelete}
+                  className="flex items-center gap-1.5 text-slate-600 hover:text-red-400 hover:bg-red-900/20 px-4 py-2 rounded-xl text-xs font-semibold transition">
+                  <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
+                  </svg>
+                  Delete
+                </button>
+                {cred.last_tested && (
+                  <span className="text-[10px] text-slate-600 ml-auto">
+                    Tested {new Date(cred.last_tested).toLocaleTimeString()}
+                  </span>
+                )}
+              </div>
+            </div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+    </motion.div>
+  );
+}
+
+// ── Main SettingsPage ──────────────────────────────────────────────────────────
 export default function SettingsPage({ onSettingsSaved }: { onSettingsSaved?: () => void } = {}) {
   const { supabase, user } = useSupabase();
-  const [settings, setSettings] = useState<SettingsData>({
-    cerebras_keys: [], nopecha_key: "",
-    cloudflare_account_id: "", cloudflare_keys: [],
-    cloudflare_model: "@cf/moonshotai/kimi-k2.6",
-    github_token: "",
-  });
-  const [saving, setSaving] = useState(false);
-  const [saved, setSaved] = useState(false);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState("");
-  const [activeSection, setActiveSection] = useState<"cerebras" | "cloudflare" | "captcha" | "github" | "system">("cerebras");
-  const [testingCF, setTestingCF] = useState(false);
-  const [cfTestResult, setCfTestResult] = useState<{ ok: boolean; msg: string } | null>(null);
+  const [cerebrasKeys,  setCerebrasKeys]  = useState<string[]>([]);
+  const [nopechaKey,    setNopechaKey]    = useState("");
+  const [cfCreds,       setCfCreds]       = useState<CFCredential[]>([]);
+  const [cfModel,       setCfModel]       = useState("@cf/moonshotai/kimi-k2.6");
+  const [githubToken,   setGithubToken]   = useState("");
+  const [saving,        setSaving]        = useState(false);
+  const [saved,         setSaved]         = useState(false);
+  const [loading,       setLoading]       = useState(true);
+  const [saveError,     setSaveError]     = useState("");
+  const [section,       setSection]       = useState<"cerebras" | "cloudflare" | "captcha" | "github" | "system">("cloudflare");
 
+  // Load settings
   useEffect(() => {
     if (!supabase || !user) return;
-    supabase.from("settings").select("*").eq("user_id", user.id).single().then(({ data }) => {
-      if (data) {
-        setSettings({
-          cerebras_keys: data.cerebras_keys || [],
-          nopecha_key: data.nopecha_key || "",
-          cloudflare_account_id: data.cloudflare_account_id || "",
-          cloudflare_keys: data.cloudflare_keys || [],
-          cloudflare_model: data.cloudflare_model || "@cf/moonshotai/kimi-k2.6",
-          github_token: data.github_token || "",
-        });
-      }
-      setLoading(false);
-    });
+    supabase.from("settings").select("*").eq("user_id", user.id).single()
+      .then(({ data }) => {
+        if (data) {
+          setCerebrasKeys(data.cerebras_keys || []);
+          setNopechaKey(data.nopecha_key || "");
+          setCfCreds(parseCFCredentials(data.cloudflare_keys || []));
+          setCfModel(data.cloudflare_model || "@cf/moonshotai/kimi-k2.6");
+          setGithubToken(data.github_token || "");
+        }
+        setLoading(false);
+      });
   }, [supabase, user]);
 
+  // Save all settings
   const save = async () => {
-    if (!supabase || !user) return;
-    setSaving(true); setError("");
+    if (!supabase || !user || saving) return;
+    setSaving(true); setSaveError("");
+
+    const serialised = serialiseCFCredentials(cfCreds);
+    const firstEnabledCred = cfCreds.find(c => c.enabled);
+
     const { error } = await supabase.from("settings").upsert({
-      user_id: user.id,
-      cerebras_keys: settings.cerebras_keys,
-      nopecha_key: settings.nopecha_key,
-      cloudflare_account_id: settings.cloudflare_account_id,
-      cloudflare_keys: settings.cloudflare_keys,
-      cloudflare_model: settings.cloudflare_model,
-      github_token: settings.github_token,
-      updated_at: new Date().toISOString(),
+      user_id:               user.id,
+      cerebras_keys:         cerebrasKeys,
+      nopecha_key:           nopechaKey,
+      cloudflare_account_id: firstEnabledCred?.account_id || "",
+      cloudflare_keys:       serialised,
+      cloudflare_model:      cfModel,
+      github_token:          githubToken,
+      updated_at:            new Date().toISOString(),
     });
-    if (error) setError(error.message);
+
     setSaving(false);
-    if (!error) {
+    if (error) {
+      setSaveError(error.message);
+    } else {
       setSaved(true);
-      setTimeout(() => setSaved(false), 2500);
+      setTimeout(() => setSaved(false), 3000);
       onSettingsSaved?.();
     }
   };
 
-  const testCloudflare = async () => {
-    if (!settings.cloudflare_account_id || settings.cloudflare_keys.length === 0) {
-      setCfTestResult({ ok: false, msg: "Account ID and at least one API key are required." });
+  // Test a single CF credential
+  const testCFCredential = async (idx: number) => {
+    const cred = cfCreds[idx];
+    if (!cred.account_id || !cred.api_key) {
+      setCfCreds(prev => prev.map((c, i) => i === idx ? { ...c, test_status: "fail", test_msg: "Account ID and API key are required." } : c));
       return;
     }
-    setTestingCF(true); setCfTestResult(null);
+
     try {
-      const key = settings.cloudflare_keys[0];
-      const model = settings.cloudflare_model || "@cf/moonshotai/kimi-k2.6";
+      const model = cred.model || cfModel || "@cf/moonshotai/kimi-k2.6";
       const res = await fetch(
-        `https://api.cloudflare.com/client/v4/accounts/${settings.cloudflare_account_id}/ai/run/${model}`,
+        `https://api.cloudflare.com/client/v4/accounts/${cred.account_id}/ai/run/${model}`,
         {
           method: "POST",
-          headers: { Authorization: `Bearer ${key}`, "Content-Type": "application/json" },
-          body: JSON.stringify({ messages: [{ role: "user", content: "Reply with the single word: OK" }] }),
+          headers: { Authorization: `Bearer ${cred.api_key}`, "Content-Type": "application/json" },
+          body: JSON.stringify({ messages: [{ role: "user", content: "Reply with: OK" }] }),
         }
       );
       const data = await res.json();
-      if (data?.result?.response) {
-        setCfTestResult({ ok: true, msg: `Connected! Model response: "${data.result.response.slice(0, 60)}"` });
-      } else {
-        setCfTestResult({ ok: false, msg: `Unexpected response: ${JSON.stringify(data).slice(0, 120)}` });
-      }
-    } catch (e: any) {
-      setCfTestResult({ ok: false, msg: e.message });
+      const ok   = !!data?.result?.response;
+      const msg  = ok
+        ? `Connected — model replied: "${String(data.result.response).slice(0, 50)}"`
+        : `Error: ${JSON.stringify(data).slice(0, 100)}`;
+
+      setCfCreds(prev => prev.map((c, i) => i === idx ? {
+        ...c,
+        test_status: ok ? "ok" : "fail",
+        test_msg: msg,
+        last_tested: new Date().toISOString(),
+      } : c));
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : String(e);
+      setCfCreds(prev => prev.map((c, i) => i === idx ? {
+        ...c,
+        test_status: "fail",
+        test_msg: msg.slice(0, 100),
+        last_tested: new Date().toISOString(),
+      } : c));
     }
-    setTestingCF(false);
   };
 
-  const sections = [
-    { id: "cerebras",   label: "Cerebras AI",       icon: "⚡" },
-    { id: "cloudflare", label: "Cloudflare AI",      icon: "☁️" },
-    { id: "captcha",    label: "CAPTCHA Solver",     icon: "🛡️" },
-    { id: "github",     label: "GitHub Integration", icon: "🐙" },
-    { id: "system",     label: "System Info",        icon: "ℹ️" },
+  const addCFCredential = () => {
+    const newCred: CFCredential = {
+      id:          nanoid(),
+      label:       `Account ${cfCreds.length + 1}`,
+      account_id:  "",
+      api_key:     "",
+      model:       cfModel || "@cf/moonshotai/kimi-k2.6",
+      enabled:     true,
+      test_status: "untested",
+      test_msg:    "",
+      last_tested: null,
+    };
+    setCfCreds(prev => [...prev, newCred]);
+    // Auto-expand new credential - it renders expanded by default since expanded state is local
+  };
+
+  const updateCred = (idx: number, updated: CFCredential) => {
+    setCfCreds(prev => prev.map((c, i) => i === idx ? updated : c));
+  };
+
+  const deleteCred = (idx: number) => {
+    setCfCreds(prev => prev.filter((_, i) => i !== idx));
+  };
+
+  const enabledCount   = cfCreds.filter(c => c.enabled).length;
+  const testedOKCount  = cfCreds.filter(c => c.test_status === "ok").length;
+  const cerabrasReady  = cerebrasKeys.length > 0;
+  const cfReady        = cfCreds.some(c => c.enabled && c.account_id && c.api_key);
+
+  const SECTIONS = [
+    { id: "cloudflare", label: "Cloudflare AI", icon: "☁️" },
+    { id: "cerebras",   label: "Cerebras AI",   icon: "⚡" },
+    { id: "captcha",    label: "CAPTCHA",        icon: "🛡️" },
+    { id: "github",     label: "GitHub",         icon: "🐙" },
+    { id: "system",     label: "Status",         icon: "📊" },
   ] as const;
 
-  if (loading) return (
-    <div className="flex items-center gap-3 text-slate-500 py-8">
-      <div className="w-4 h-4 border-2 border-slate-600 border-t-blue-500 rounded-full animate-spin" />
-      Loading settings...
-    </div>
-  );
+  if (loading) {
+    return (
+      <div className="flex items-center gap-3 text-slate-500 py-12">
+        <div className="w-4 h-4 border-2 border-slate-600 border-t-blue-500 rounded-full animate-spin" />
+        Loading settings…
+      </div>
+    );
+  }
 
   return (
-    <div className="max-w-3xl space-y-6">
+    <div className="max-w-3xl space-y-5">
+      {/* Header */}
       <div>
         <h2 className="text-xl font-bold text-white">Settings</h2>
-        <p className="text-sm text-slate-500 mt-1">Configure API keys, AI models, and system behavior.</p>
+        <p className="text-sm text-slate-500 mt-0.5">Configure AI providers, credentials, and browser automation.</p>
       </div>
 
+      {/* Section tabs */}
       <div className="flex gap-2 flex-wrap">
-        {sections.map(s => (
-          <button key={s.id} onClick={() => setActiveSection(s.id)}
-            className={`flex items-center gap-1.5 px-3.5 py-2 rounded-xl text-sm font-semibold border transition touch-manipulation ${
-              activeSection === s.id
-                ? "bg-blue-600/20 text-blue-400 border-blue-600/30"
+        {SECTIONS.map(s => (
+          <button key={s.id} onClick={() => setSection(s.id)}
+            className={`flex items-center gap-1.5 px-3.5 py-2 rounded-xl text-sm font-semibold border transition ${
+              section === s.id
+                ? "bg-blue-600/20 text-blue-400 border-blue-500/30"
                 : "text-slate-400 border-slate-800 hover:border-slate-700 hover:text-white"
             }`}>
-            <span className="text-base leading-none">{s.icon}</span>
+            <span>{s.icon}</span>
             <span className="hidden sm:inline">{s.label}</span>
           </button>
         ))}
       </div>
 
+      {/* Content */}
       <AnimatePresence mode="wait">
 
-        {activeSection === "cerebras" && (
+        {/* ── Cloudflare AI ── */}
+        {section === "cloudflare" && (
+          <motion.div key="cf" initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0 }}>
+            <div className="space-y-4">
+              {/* Info bar */}
+              <div className="bg-slate-900 border border-slate-800 rounded-2xl px-5 py-4 flex flex-wrap items-center gap-4">
+                <div className="flex-1 min-w-0">
+                  <h3 className="font-bold text-white flex items-center gap-2">
+                    <span className="text-orange-400">☁️</span> Cloudflare Workers AI
+                  </h3>
+                  <p className="text-xs text-slate-500 mt-0.5">
+                    Multi-account support · Auto-rotation on rate limits · Per-credential enable/disable
+                  </p>
+                </div>
+                <div className="flex gap-3 text-xs flex-shrink-0">
+                  <div className="text-center">
+                    <p className="font-bold text-white text-base">{cfCreds.length}</p>
+                    <p className="text-slate-500">Total</p>
+                  </div>
+                  <div className="text-center">
+                    <p className={`font-bold text-base ${enabledCount > 0 ? "text-green-400" : "text-slate-500"}`}>{enabledCount}</p>
+                    <p className="text-slate-500">Active</p>
+                  </div>
+                  <div className="text-center">
+                    <p className={`font-bold text-base ${testedOKCount > 0 ? "text-blue-400" : "text-slate-500"}`}>{testedOKCount}</p>
+                    <p className="text-slate-500">Verified</p>
+                  </div>
+                </div>
+              </div>
+
+              {/* Default model selector */}
+              <div className="bg-slate-900 border border-slate-800 rounded-2xl px-5 py-4">
+                <label className="block text-xs font-bold uppercase tracking-widest text-slate-500 mb-2">Default Model (used when credential has no model set)</label>
+                <select value={cfModel} onChange={e => setCfModel(e.target.value)}
+                  className="w-full bg-slate-800 border border-slate-700 rounded-xl px-4 py-2.5 text-sm text-white focus:outline-none focus:border-orange-500 transition">
+                  {CF_MODELS.map(m => <option key={m.value} value={m.value}>{m.label}</option>)}
+                </select>
+              </div>
+
+              {/* Credential list */}
+              {cfCreds.length === 0 ? (
+                <div className="text-center py-12 border border-dashed border-slate-800 rounded-2xl">
+                  <div className="text-4xl mb-3">☁️</div>
+                  <p className="text-sm font-semibold text-slate-400 mb-1">No Cloudflare credentials</p>
+                  <p className="text-xs text-slate-600 mb-4">Add your first Cloudflare account to enable AI vision.</p>
+                  <button onClick={addCFCredential}
+                    className="bg-orange-600/20 border border-orange-600/30 hover:bg-orange-600/30 text-orange-300 px-6 py-2.5 rounded-xl text-sm font-bold transition">
+                    + Add First Credential
+                  </button>
+                </div>
+              ) : (
+                <div className="space-y-2">
+                  <AnimatePresence>
+                    {cfCreds.map((cred, i) => (
+                      <CFCredentialCard
+                        key={cred.id}
+                        cred={cred}
+                        index={i}
+                        onUpdate={updated => updateCred(i, updated)}
+                        onDelete={() => deleteCred(i)}
+                        onTest={() => testCFCredential(i)}
+                      />
+                    ))}
+                  </AnimatePresence>
+                </div>
+              )}
+
+              {cfCreds.length > 0 && (
+                <button onClick={addCFCredential}
+                  className="w-full border border-dashed border-slate-700 hover:border-orange-600/50 hover:bg-orange-600/5 text-slate-500 hover:text-orange-300 py-3 rounded-2xl text-sm font-semibold transition flex items-center justify-center gap-2">
+                  <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 4v16m8-8H4" />
+                  </svg>
+                  Add Another Credential
+                </button>
+              )}
+
+              {enabledCount > 1 && (
+                <div className="bg-orange-900/10 border border-orange-800/20 rounded-2xl px-4 py-3">
+                  <p className="text-xs text-orange-400">
+                    <span className="font-bold">🔄 Auto-rotation active:</span> {enabledCount} credentials will be used in round-robin order.
+                    On rate limits or failures, the agent automatically switches to the next available credential.
+                  </p>
+                </div>
+              )}
+            </div>
+          </motion.div>
+        )}
+
+        {/* ── Cerebras AI ── */}
+        {section === "cerebras" && (
           <motion.div key="cerebras" initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0 }}>
             <div className="bg-slate-900 border border-slate-800 rounded-2xl p-6 space-y-5">
               <div className="flex items-start justify-between">
@@ -229,141 +578,61 @@ export default function SettingsPage({ onSettingsSaved }: { onSettingsSaved?: ()
                   <h3 className="font-bold text-white flex items-center gap-2">
                     <span className="text-purple-400">⚡</span> Cerebras AI Key Pool
                   </h3>
-                  <p className="text-xs text-slate-500 mt-1">Model: <span className="font-mono text-purple-300">gpt-oss-120b</span></p>
-                  <p className="text-xs text-slate-500">Keys rotate automatically to avoid rate limits. Add unlimited keys.</p>
+                  <p className="text-xs text-slate-500 mt-1">
+                    Primary AI for browser decision making · Models: gpt-oss-120b, qwen-3-235b, llama3.1-8b
+                  </p>
+                  <p className="text-xs text-slate-500">Keys rotate automatically to avoid rate limits.</p>
                 </div>
-                <span className="bg-purple-900/30 text-purple-300 text-xs font-bold px-3 py-1 rounded-full border border-purple-800/30 flex-shrink-0">
-                  {settings.cerebras_keys.length} key{settings.cerebras_keys.length !== 1 ? "s" : ""}
+                <span className={`text-xs font-bold px-3 py-1 rounded-full border flex-shrink-0 ${
+                  cerabrasReady
+                    ? "bg-purple-900/30 text-purple-300 border-purple-800/30"
+                    : "bg-slate-800 text-slate-500 border-slate-700"
+                }`}>
+                  {cerebrasKeys.length} key{cerebrasKeys.length !== 1 ? "s" : ""}
                 </span>
               </div>
-              <KeyPool
-                keys={settings.cerebras_keys}
-                onAdd={k => setSettings(s => ({ ...s, cerebras_keys: [...s.cerebras_keys, k] }))}
-                onRemove={i => setSettings(s => ({ ...s, cerebras_keys: s.cerebras_keys.filter((_, j) => j !== i) }))}
-                placeholder="csk-…"
-                label="Cerebras keys"
-              />
-              {settings.cerebras_keys.length > 1 && (
-                <div className="p-3 bg-green-900/10 border border-green-800/30 rounded-xl">
-                  <p className="text-xs text-green-400">
-                    <span className="font-bold">Key rotation active:</span> {settings.cerebras_keys.length} keys cycling round-robin.
-                    Estimated capacity: ~{settings.cerebras_keys.length * 60} req/min.
-                  </p>
-                </div>
-              )}
-            </div>
-          </motion.div>
-        )}
 
-        {activeSection === "cloudflare" && (
-          <motion.div key="cloudflare" initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0 }}>
-            <div className="bg-slate-900 border border-slate-800 rounded-2xl p-6 space-y-5">
-              <div>
-                <h3 className="font-bold text-white flex items-center gap-2">
-                  <span className="text-orange-400">☁️</span> Cloudflare Workers AI
-                </h3>
-                <p className="text-xs text-slate-500 mt-1">
-                  Vision AI for screenshot analysis during browser automation. Keys rotate automatically on rate limits.
+              <div className="bg-blue-900/10 border border-blue-800/20 rounded-xl px-4 py-3">
+                <p className="text-xs text-blue-400">
+                  <span className="font-bold">💡 Title generation:</span> Cerebras keys are also used to generate smart conversation titles automatically.
                 </p>
               </div>
 
-              <div>
-                <label className="block text-xs font-bold uppercase tracking-widest text-slate-500 mb-1.5">Account ID</label>
-                <input
-                  value={settings.cloudflare_account_id}
-                  onChange={e => setSettings(s => ({ ...s, cloudflare_account_id: e.target.value }))}
-                  className="w-full bg-slate-800 border border-slate-700 rounded-xl px-4 py-2.5 text-sm text-white placeholder-slate-500 focus:outline-none focus:border-orange-500 transition font-mono"
-                  placeholder="7d26fd976f99b5593254eb98cf594dd5"
-                />
-              </div>
+              <CerebrasKeyPool
+                keys={cerebrasKeys}
+                onAdd={k => setCerebrasKeys(p => [...p, k])}
+                onRemove={i => setCerebrasKeys(p => p.filter((_, j) => j !== i))}
+              />
 
-              <div>
-                <label className="block text-xs font-bold uppercase tracking-widest text-slate-500 mb-1.5">
-                  AI Model
-                </label>
-                <select
-                  value={settings.cloudflare_model}
-                  onChange={e => setSettings(s => ({ ...s, cloudflare_model: e.target.value }))}
-                  className="w-full bg-slate-800 border border-slate-700 rounded-xl px-4 py-2.5 text-sm text-white focus:outline-none focus:border-orange-500 transition"
-                >
-                  {CLOUDFLARE_MODELS.map(m => (
-                    <option key={m.value} value={m.value}>{m.label}</option>
-                  ))}
-                </select>
-                <p className="text-[11px] text-slate-600 mt-1">Default: @cf/moonshotai/kimi-k2.6 (multimodal vision)</p>
-              </div>
-
-              <div>
-                <div className="flex items-center justify-between mb-2">
-                  <label className="text-xs font-bold uppercase tracking-widest text-slate-500">API Key Pool</label>
-                  <span className="bg-orange-900/30 text-orange-300 text-xs font-bold px-3 py-1 rounded-full border border-orange-800/30">
-                    {settings.cloudflare_keys.length} key{settings.cloudflare_keys.length !== 1 ? "s" : ""}
-                  </span>
-                </div>
-                <KeyPool
-                  keys={settings.cloudflare_keys}
-                  onAdd={k => setSettings(s => ({ ...s, cloudflare_keys: [...s.cloudflare_keys, k] }))}
-                  onRemove={i => setSettings(s => ({ ...s, cloudflare_keys: s.cloudflare_keys.filter((_, j) => j !== i) }))}
-                  placeholder="cfut_…"
-                  label="Cloudflare keys"
-                />
-              </div>
-
-              {settings.cloudflare_keys.length > 1 && (
-                <div className="p-3 bg-orange-900/10 border border-orange-800/30 rounded-xl">
-                  <p className="text-xs text-orange-400">
-                    <span className="font-bold">Auto-rotation active:</span> {settings.cloudflare_keys.length} keys will rotate on rate limits or errors.
+              {cerebrasKeys.length > 1 && (
+                <div className="p-3 bg-purple-900/10 border border-purple-800/20 rounded-xl">
+                  <p className="text-xs text-purple-400">
+                    <span className="font-bold">Key rotation active:</span> {cerebrasKeys.length} keys cycling round-robin.
+                    Estimated capacity: ~{cerebrasKeys.length * 60} req/min.
                   </p>
                 </div>
               )}
-
-              <div className="flex items-center gap-3">
-                <button onClick={testCloudflare} disabled={testingCF || !settings.cloudflare_account_id || settings.cloudflare_keys.length === 0}
-                  className="flex items-center gap-2 bg-orange-600/20 border border-orange-600/30 hover:bg-orange-600/30 disabled:opacity-40 text-orange-300 px-5 py-2.5 rounded-xl text-sm font-bold transition">
-                  {testingCF ? (
-                    <><div className="w-4 h-4 border-2 border-orange-400 border-t-transparent rounded-full animate-spin" /> Testing…</>
-                  ) : (
-                    <>
-                      <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 10V3L4 14h7v7l9-11h-7z" />
-                      </svg>
-                      Test Connection
-                    </>
-                  )}
-                </button>
-                {cfTestResult && (
-                  <motion.span initial={{ opacity: 0 }} animate={{ opacity: 1 }}
-                    className={`text-sm flex items-center gap-1.5 ${cfTestResult.ok ? "text-green-400" : "text-red-400"}`}>
-                    {cfTestResult.ok ? "✓" : "✗"} {cfTestResult.msg}
-                  </motion.span>
-                )}
-              </div>
             </div>
           </motion.div>
         )}
 
-        {activeSection === "captcha" && (
+        {/* ── CAPTCHA ── */}
+        {section === "captcha" && (
           <motion.div key="captcha" initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0 }}>
             <div className="bg-slate-900 border border-slate-800 rounded-2xl p-6 space-y-5">
               <div>
                 <h3 className="font-bold text-white flex items-center gap-2">
                   <span className="text-green-400">🛡️</span> NopeCHA CAPTCHA Solver
                 </h3>
-                <p className="text-xs text-slate-500 mt-1">
-                  Automatically solves CAPTCHAs encountered during agent tasks.
-                </p>
+                <p className="text-xs text-slate-500 mt-1">Automatically bypasses CAPTCHAs encountered during automation.</p>
               </div>
               <div>
                 <label className="block text-xs font-bold uppercase tracking-widest text-slate-500 mb-1.5">NopeCHA API Key</label>
-                <RevealableInput
-                  value={settings.nopecha_key}
-                  onChange={v => setSettings(s => ({ ...s, nopecha_key: v }))}
-                  placeholder="nopecha_…"
-                />
+                <RevealInput value={nopechaKey} onChange={setNopechaKey} placeholder="nopecha_…" />
               </div>
-              <div className="grid grid-cols-2 gap-3">
+              <div className="grid grid-cols-2 sm:grid-cols-3 gap-2">
                 {["reCAPTCHA v2", "reCAPTCHA v3", "hCaptcha", "CF Turnstile", "JS Challenge", "Funcaptcha"].map(t => (
-                  <div key={t} className="flex items-center gap-2 p-3 bg-green-900/10 border border-green-800/20 rounded-xl">
+                  <div key={t} className="flex items-center gap-2 p-2.5 bg-green-900/10 border border-green-800/20 rounded-xl">
                     <div className="w-2 h-2 rounded-full bg-green-400 flex-shrink-0" />
                     <p className="text-xs font-semibold text-white">{t}</p>
                   </div>
@@ -373,7 +642,8 @@ export default function SettingsPage({ onSettingsSaved }: { onSettingsSaved?: ()
           </motion.div>
         )}
 
-        {activeSection === "github" && (
+        {/* ── GitHub ── */}
+        {section === "github" && (
           <motion.div key="github" initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0 }}>
             <div className="bg-slate-900 border border-slate-800 rounded-2xl p-6 space-y-5">
               <div>
@@ -381,76 +651,122 @@ export default function SettingsPage({ onSettingsSaved }: { onSettingsSaved?: ()
                   <span>🐙</span> GitHub Integration
                 </h3>
                 <p className="text-xs text-slate-500 mt-1">
-                  Add a GitHub Personal Access Token to enable <span className="text-blue-400 font-semibold">instant task execution</span> — skips the 10-minute GitHub Actions schedule and runs tasks immediately.
+                  GitHub PAT enables <span className="text-blue-400 font-semibold">instant task execution</span> — bypasses the 10-minute cron schedule.
                 </p>
               </div>
               <div>
                 <label className="block text-xs font-bold uppercase tracking-widest text-slate-500 mb-1.5">Personal Access Token</label>
-                <RevealableInput
-                  value={settings.github_token}
-                  onChange={v => setSettings(s => ({ ...s, github_token: v }))}
-                  placeholder="github_pat_…"
-                />
-                <p className="text-[11px] text-slate-600 mt-1.5">
-                  Required scopes: <span className="font-mono text-slate-500">repo, workflow</span>
-                </p>
+                <RevealInput value={githubToken} onChange={setGithubToken} placeholder="github_pat_…" />
+                <p className="text-[11px] text-slate-600 mt-1.5">Required scopes: <span className="font-mono">repo, workflow</span></p>
               </div>
               <div className="p-3 bg-blue-900/10 border border-blue-800/20 rounded-xl">
                 <p className="text-xs text-blue-400">
-                  <span className="font-bold">How it works:</span> When you click "Run Task", instead of waiting for the scheduler,
-                  the app instantly triggers your GitHub Actions workflow. Tasks start in seconds, not minutes.
+                  <span className="font-bold">How it works:</span> When you click Run Task, the app calls GitHub API to immediately trigger the Actions workflow.
+                  Without this token, tasks wait for the next 10-minute cron cycle.
                 </p>
               </div>
             </div>
           </motion.div>
         )}
 
-        {activeSection === "system" && (
+        {/* ── System Status ── */}
+        {section === "system" && (
           <motion.div key="system" initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0 }}>
-            <div className="bg-slate-900 border border-slate-800 rounded-2xl p-6 space-y-1">
+            <div className="bg-slate-900 border border-slate-800 rounded-2xl p-6">
               <h3 className="font-bold text-white mb-4">System Status</h3>
-              {[
-                { label: "Cerebras AI",       ok: settings.cerebras_keys.length > 0,     detail: `${settings.cerebras_keys.length} key(s) — gpt-oss-120b` },
-                { label: "Cloudflare AI",     ok: !!settings.cloudflare_account_id && settings.cloudflare_keys.length > 0, detail: settings.cloudflare_model || "@cf/moonshotai/kimi-k2.6" },
-                { label: "CAPTCHA Solver",    ok: !!settings.nopecha_key,                detail: settings.nopecha_key ? "NopeCHA configured" : "Not configured" },
-                { label: "Instant Execution", ok: !!settings.github_token,               detail: settings.github_token ? "GitHub PAT configured" : "Using 10-min schedule" },
-                { label: "Database",          ok: true,                                  detail: "Supabase connected" },
-                { label: "Browser Agent",     ok: true,                                  detail: "Playwright stealth + human-like" },
-              ].map(item => (
-                <div key={item.label} className="flex items-center justify-between py-2.5 border-b border-slate-800 last:border-0">
-                  <div>
-                    <p className="text-sm font-semibold text-white">{item.label}</p>
-                    <p className="text-xs text-slate-500">{item.detail}</p>
+              <div className="space-y-0.5">
+                {[
+                  {
+                    label:  "Cerebras AI",
+                    ok:     cerebrasKeys.length > 0,
+                    detail: cerebrasKeys.length > 0
+                      ? `${cerebrasKeys.length} key(s) · gpt-oss-120b, qwen-3-235b, llama3.1-8b`
+                      : "No keys — add at least one key",
+                  },
+                  {
+                    label:  "Cloudflare AI",
+                    ok:     cfReady,
+                    detail: cfReady
+                      ? `${enabledCount} credential(s) active · ${testedOKCount} verified · ${cfModel}`
+                      : "No credentials configured",
+                  },
+                  {
+                    label:  "Auto-Rotation",
+                    ok:     enabledCount > 1,
+                    detail: enabledCount > 1
+                      ? `${enabledCount} Cloudflare credentials rotating · ${cerebrasKeys.length > 1 ? cerebrasKeys.length + " Cerebras keys rotating" : ""}`
+                      : "Add multiple credentials to enable rotation",
+                  },
+                  {
+                    label:  "CAPTCHA Solver",
+                    ok:     !!nopechaKey,
+                    detail: nopechaKey ? "NopeCHA configured" : "Optional — add key to bypass CAPTCHAs",
+                  },
+                  {
+                    label:  "Instant Execution",
+                    ok:     !!githubToken,
+                    detail: githubToken ? "GitHub PAT set — tasks start immediately" : "Tasks wait for 10-min schedule",
+                  },
+                  {
+                    label:  "Database",
+                    ok:     true,
+                    detail: "Supabase Realtime connected",
+                  },
+                  {
+                    label:  "Browser Agent",
+                    ok:     true,
+                    detail: "Playwright stealth · human-like timing · anti-detection",
+                  },
+                ].map(item => (
+                  <div key={item.label} className="flex items-center justify-between py-3 border-b border-slate-800 last:border-0">
+                    <div className="min-w-0 flex-1">
+                      <p className="text-sm font-semibold text-white">{item.label}</p>
+                      <p className="text-xs text-slate-500 mt-0.5 leading-relaxed">{item.detail}</p>
+                    </div>
+                    <div className={`ml-4 flex items-center gap-1.5 text-xs font-bold px-2.5 py-1 rounded-full border flex-shrink-0 ${
+                      item.ok
+                        ? "bg-green-900/30 text-green-400 border-green-800/30"
+                        : "bg-amber-900/30 text-amber-400 border-amber-800/30"
+                    }`}>
+                      <div className={`w-1.5 h-1.5 rounded-full ${item.ok ? "bg-green-400" : "bg-amber-400"}`} />
+                      {item.ok ? "Ready" : "Setup needed"}
+                    </div>
                   </div>
-                  <div className={`flex items-center gap-1.5 text-xs font-bold px-2.5 py-1 rounded-full border flex-shrink-0 ${
-                    item.ok ? "bg-green-900/30 text-green-400 border-green-800/30" : "bg-amber-900/30 text-amber-400 border-amber-800/30"
-                  }`}>
-                    <div className={`w-1.5 h-1.5 rounded-full ${item.ok ? "bg-green-400" : "bg-amber-400"}`} />
-                    {item.ok ? "OK" : "Setup needed"}
-                  </div>
-                </div>
-              ))}
+                ))}
+              </div>
             </div>
           </motion.div>
         )}
 
       </AnimatePresence>
 
-      {activeSection !== "system" && (
-        <div className="flex items-center gap-3">
+      {/* Save button (always visible except system) */}
+      {section !== "system" && (
+        <div className="flex items-center gap-3 pt-2">
           <button onClick={save} disabled={saving}
-            className="bg-blue-600 hover:bg-blue-500 disabled:opacity-50 text-white font-bold px-8 py-3 rounded-xl transition shadow-lg shadow-blue-600/20">
-            {saving ? "Saving..." : "Save Settings"}
+            className="bg-blue-600 hover:bg-blue-500 disabled:opacity-50 text-white font-bold px-8 py-3 rounded-xl transition shadow-lg shadow-blue-600/20 flex items-center gap-2">
+            {saving
+              ? <><div className="w-4 h-4 border-2 border-white/40 border-t-white rounded-full animate-spin" /> Saving…</>
+              : "Save Settings"
+            }
           </button>
-          {saved && (
-            <motion.span initial={{ opacity: 0 }} animate={{ opacity: 1 }} className="text-green-400 text-sm flex items-center gap-1.5">
-              <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" />
-              </svg>
-              Settings saved!
-            </motion.span>
-          )}
-          {error && <p className="text-red-400 text-sm">{error}</p>}
+          <AnimatePresence>
+            {saved && (
+              <motion.span initial={{ opacity: 0, x: -8 }} animate={{ opacity: 1, x: 0 }} exit={{ opacity: 0 }}
+                className="text-green-400 text-sm flex items-center gap-1.5">
+                <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" />
+                </svg>
+                Saved!
+              </motion.span>
+            )}
+            {saveError && (
+              <motion.span initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}
+                className="text-red-400 text-sm">
+                ✗ {saveError}
+              </motion.span>
+            )}
+          </AnimatePresence>
         </div>
       )}
     </div>

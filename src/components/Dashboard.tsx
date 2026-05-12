@@ -38,22 +38,19 @@ interface SettingsData {
   github_token?: string;
 }
 
-// ── Title generation ──────────────────────────────────────────────────────────
+// ── Title generation ─────────────────────────────────────────────────────────
 function generateTitle(prompt: string): string {
   const p = prompt.trim();
   const urlM = p.match(/(?:go to|visit|navigate to|open|browse)\s+((?:https?:\/\/)?[\w-]+\.(?:com|org|net|io|co|gov|edu|uk|app|dev|ai|gg|xyz|me)(?:\/\S*)?)/i);
   const domain = urlM ? urlM[1].replace(/^https?:\/\//, "").replace(/^www\./, "").split("/")[0] : null;
-
-  const searchM  = p.match(/search(?:ing)?\s+for\s+["']?([^"',.\n]{3,40})["']?/i);
+  const searchM  = p.match(/search(?:ing)?\s+for\s+["\']?([^"\',\.\n]{3,40})["\']?/i);
   const loginM   = p.match(/(?:log\s*in|login|sign\s*in|signin)\s+(?:to\s+|into\s+)?(.{3,30}?)(?:\s+and|\s+then|\.|,|$)/i);
   const extractM = p.match(/(?:extract|scrape|get|find|list|collect|grab)\s+(.{4,35}?)(?:\s+from|\s+on|\s+at|\.|,|$)/i);
   const buyM     = p.match(/(?:buy|purchase|order|add to cart)\s+(.{3,30}?)(?:\s+from|\s+on|\.|,|$)/i);
   const dlM      = p.match(/(?:download|save|export)\s+(.{3,30}?)(?:\s+from|\s+on|\.|,|$)/i);
   const fillM    = p.match(/(?:fill|complete|submit)\s+(.{4,35}?)(?:\s+form|\s+on|\.|,|$)/i);
-
   const cap = (s: string) => s.charAt(0).toUpperCase() + s.slice(1);
-  const tr  = (s: string, n: number) => s.length > n ? s.slice(0, n - 1) + "…" : s;
-
+  const tr  = (s: string, n: number) => s.length > n ? s.slice(0, n - 1) + "\u2026" : s;
   if (loginM) return `Login: ${cap(loginM[1].trim())}`;
   if (buyM)   return `Purchase: ${cap(tr(buyM[1].trim(), 30))}`;
   if (dlM)    return `Download: ${cap(tr(dlM[1].trim(), 30))}`;
@@ -65,6 +62,40 @@ function generateTitle(prompt: string): string {
   if (domain)   return `Browse ${domain}`;
   const first = p.split(/[.!?\n]/)[0].trim();
   return tr(cap(first), 50);
+}
+
+// Cerebras-powered title generation (async, with heuristic fallback)
+async function generateTitleWithAI(prompt: string, cerebrasKeys: string[]): Promise<string> {
+  const fallback = generateTitle(prompt);
+  if (!cerebrasKeys || cerebrasKeys.length === 0) return fallback;
+
+  const key = cerebrasKeys[Math.floor(Math.random() * cerebrasKeys.length)];
+  try {
+    const res = await fetch("https://api.cerebras.ai/v1/chat/completions", {
+      method: "POST",
+      headers: { Authorization: `Bearer ${key}`, "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: "llama3.1-8b",
+        messages: [
+          {
+            role: "system",
+            content: "You generate ultra-short conversation titles for browser automation tasks. Rules: max 6 words, title case, no quotes, no punctuation at end, summarize the core action. Examples: Search Price on Amazon | LinkedIn Job Extraction | GitHub Trending Repos | Wikipedia AI Summary | Google News Headlines"
+          },
+          { role: "user", content: `Task: ${prompt.slice(0, 300)}\n\nGenerate a title:` }
+        ],
+        temperature: 0.3,
+        max_tokens: 20,
+        stream: false,
+      }),
+    });
+    if (!res.ok) return fallback;
+    const data = await res.json();
+    const title = data?.choices?.[0]?.message?.content?.trim();
+    if (title && title.length > 2 && title.length < 60) {
+      return title.replace(/^["\']|["\']$/g, "").trim();
+    }
+  } catch { /* fallback */ }
+  return fallback;
 }
 
 // ── Meta ──────────────────────────────────────────────────────────────────────
@@ -653,7 +684,7 @@ export default function Dashboard() {
     setCreating(true);
     setCreateError("");
 
-    const name = generateTitle(prompt);
+    const name = await generateTitleWithAI(prompt, settings?.cerebras_keys || []);
 
     const { data, error } = await supabase.from("tasks").insert({
       user_id:    user.id,
