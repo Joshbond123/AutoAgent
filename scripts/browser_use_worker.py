@@ -626,14 +626,30 @@ CRITICAL RULES:
             elif action_type == "EXTRACT":
                 js_expr = action.get("js", "")
                 label   = action.get("label", "data")
-                if js_expr:
+                if not js_expr:
+                    # Model forgot to include js field — use a sensible default
+                    js_expr = "document.body.innerText.slice(0, 1000)"
+                    label   = "page-content"
+                    log(task_id, "⚠️ EXTRACT missing js field — using page text fallback", "warning", supabase)
+                try:
+                    extracted = await page.evaluate(js_expr)
+                    if extracted is None:
+                        # Try page text fallback
+                        extracted = await page.evaluate("document.body.innerText.slice(0,500)")
+                    extracted_str = str(extracted)[:600] if extracted else "(empty — page may need more time to load)"
+                    memory.append(f"{label}: {extracted_str}")
+                    log(task_id, f"📊 Extracted [{label}]: {extracted_str[:250]}", "success", supabase)
+                    # Reset consecutive waits on successful extract
+                    consecutive_waits = 0
+                except Exception as e:
+                    log(task_id, f"Extract error ({js_expr[:60]}): {str(e)[:80]}", "warning", supabase)
+                    # Fallback: get visible text
                     try:
-                        extracted = await page.evaluate(js_expr)
-                        extracted_str = str(extracted)[:500] if extracted else "(empty)"
-                        memory.append(f"{label}: {extracted_str}")
-                        log(task_id, f"📊 Extracted [{label}]: {extracted_str[:200]}", "success", supabase)
-                    except Exception as e:
-                        log(task_id, f"Extract error: {str(e)[:80]}", "warning", supabase)
+                        fallback = await page.evaluate("document.body.innerText.slice(0,300)")
+                        memory.append(f"{label}-fallback: {fallback}")
+                        log(task_id, f"📊 Extracted [{label}-fallback via body text]: {str(fallback)[:150]}", "success", supabase)
+                    except Exception:
+                        pass
 
             elif action_type == "WAIT":
                 ms = min(action.get("ms", 2000), 8000)
