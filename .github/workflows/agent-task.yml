@@ -1,97 +1,61 @@
-name: Worker - Autonomous Browser Agent
+name: Run Agent Task
 
 on:
   schedule:
     - cron: "*/10 * * * *"
   workflow_dispatch:
     inputs:
-      taskId:
-        description: 'Task ID to run (empty = all pending)'
+      task_id:
+        description: "Supabase task UUID to run"
         required: false
-        default: ''
-      runtime:
-        description: 'Runtime to use (python=BrowserUse, node=Playwright)'
-        required: false
-        default: 'python'
+        default: ""
 
 jobs:
   run-agent:
-    name: Execute Browser Agent
     runs-on: ubuntu-latest
-    timeout-minutes: 30
-
+    timeout-minutes: 15
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: '20'
-          cache: 'npm'
-
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
-          cache: 'pip'
+          python-version: "3.11"
 
-      - name: Install Python dependencies
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q chromium-browser chromium-chromedriver \
+            libglib2.0-0 libnss3 libgconf-2-4 libfontconfig1 \
+            libx11-xcb1 libxcomposite1 libxcursor1 libxdamage1 \
+            libxi6 libxtst6 libatk-bridge2.0-0 libgtk-3-0 libgbm1
+
+      - name: Install Python packages
         run: |
           pip install --upgrade pip
-          pip install browser-use langchain-google-genai supabase playwright
-          pip install nopecha-python || true
+          pip install \
+            browser-use \
+            playwright \
+            langchain-google-genai \
+            supabase \
+            httpx \
+            python-dotenv
+          playwright install chromium
 
-      - name: Install Node dependencies
-        run: npm ci --ignore-scripts
-
-      - name: Install Playwright Browsers
-        run: |
-          python -m playwright install --with-deps chromium
-          npx playwright install --with-deps chromium
-
-      - name: Verify Setup
-        run: |
-          echo "Node: $(node --version)"
-          echo "Python: $(python --version)"
-          python -c "import browser_use; print('Browser Use:', browser_use.__version__)" 2>/dev/null || echo "Browser Use not available"
-          python -c "import playwright; print('Playwright OK')"
-
-      - name: Run Browser Agent (Python / Browser Use)
-        if: ${{ github.event.inputs.runtime != 'node' }}
+      - name: Run pending tasks
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          CEREBRAS_API_KEYS: ${{ secrets.CEREBRAS_API_KEYS }}
           NOPECHA_API_KEY: ${{ secrets.NOPECHA_API_KEY }}
-          TASK_ID: ${{ github.event.inputs.taskId }}
-          DISPLAY: ":99"
+          TASK_ID: ${{ github.event.inputs.task_id }}
         run: |
-          # Run all pending tasks if no specific task ID
-          if [ -z "$TASK_ID" ]; then
+          if [ -n "$TASK_ID" ]; then
+            echo "Running specific task: $TASK_ID"
+            python scripts/browser_use_worker.py "$TASK_ID"
+          else
             echo "Running all pending tasks..."
             python scripts/run_pending_tasks.py
-          else
-            echo "Running task: $TASK_ID"
-            python scripts/browser_use_worker.py "$TASK_ID"
           fi
-
-      - name: Run Browser Agent (Node / Playwright fallback)
-        if: ${{ github.event.inputs.runtime == 'node' }}
-        env:
-          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
-          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-          NOPECHA_API_KEY: ${{ secrets.NOPECHA_API_KEY }}
-          TASK_ID: ${{ github.event.inputs.taskId }}
-          NODE_ENV: production
-        run: npx tsx scripts/worker.ts
-
-      - name: Upload screenshots
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: agent-screenshots-${{ github.run_id }}
-          path: /tmp/agent_*.png
-          retention-days: 7
-          if-no-files-found: ignore
