@@ -1,17 +1,19 @@
 {
-  "name": "react-example",
+  "name": "autoagent-pro",
   "private": true,
-  "version": "0.0.0",
+  "version": "2.0.0",
   "type": "module",
   "scripts": {
     "dev": "tsx server.ts",
     "start": "node server.js",
     "build": "vite build",
+    "preview": "vite preview",
     "clean": "rm -rf dist",
-    "lint": "tsc --noEmit"
+    "lint": "tsc --noEmit",
+    "test:agent": "npx tsx scripts/test_agent.ts",
+    "test:captcha": "python scripts/test_captcha.py"
   },
   "dependencies": {
-    "@base-ui/react": "^1.4.1",
     "@fontsource-variable/geist": "^5.2.8",
     "@google/genai": "^1.29.0",
     "@supabase/supabase-js": "^2.105.4",
@@ -28,10 +30,9 @@
     "lucide-react": "^0.546.0",
     "motion": "^12.23.24",
     "node-cron": "^4.2.1",
-    "playwright": "^1.60.0",
+    "playwright": "^1.50.0",
     "react": "^19.0.1",
     "react-dom": "^19.0.1",
-    "shadcn": "^4.7.0",
     "socket.io": "^4.8.3",
     "socket.io-client": "^4.8.3",
     "tailwind-merge": "^3.6.0",
@@ -42,10 +43,11 @@
   "devDependencies": {
     "@types/express": "^4.17.21",
     "@types/node": "^22.14.0",
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
     "autoprefixer": "^10.4.21",
     "tailwindcss": "^4.1.14",
     "tsx": "^4.21.0",
-    "typescript": "~5.8.2",
-    "vite": "^6.2.3"
+    "typescript": "~5.8.2"
   }
 }
