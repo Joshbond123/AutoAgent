@@ -6,22 +6,24 @@ on:
   workflow_dispatch:
     inputs:
       task_id:
-        description: "Supabase task UUID to run"
+        description: "Supabase task UUID to run (leave blank for all pending)"
         required: false
         default: ""
 
 jobs:
   run-agent:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup Python
+      - name: Setup Python 3.11
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+          cache: "pip"
 
       - name: Install system dependencies
         run: |
@@ -46,18 +48,29 @@ jobs:
 
       - name: Install Python packages
         run: |
-          pip install --upgrade pip
-          pip install playwright httpx supabase python-dotenv
-          pip install browser-use langchain-google-genai || true
+          pip install --upgrade pip --quiet
+          pip install \
+            playwright \
+            httpx \
+            "supabase>=2.0.0" \
+            python-dotenv \
+            --quiet
           playwright install chromium --with-deps
+
+      - name: Validate environment
+        run: |
+          python -c "import playwright; print('Playwright OK')"
+          python -c "from supabase import create_client; print('Supabase OK')"
+          python -c "import httpx; print('httpx OK')"
 
       - name: Run agent task
         env:
-          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_URL:              ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
-          CEREBRAS_API_KEYS: ${{ secrets.CEREBRAS_API_KEYS }}
-          NOPECHA_API_KEY: ${{ secrets.NOPECHA_API_KEY }}
-          TASK_ID: ${{ github.event.inputs.task_id }}
+          CEREBRAS_API_KEYS:         ${{ secrets.CEREBRAS_API_KEYS }}
+          NOPECHA_API_KEY:           ${{ secrets.NOPECHA_API_KEY }}
+          GEMINI_API_KEY:            ${{ secrets.GEMINI_API_KEY }}
+          TASK_ID:                   ${{ github.event.inputs.task_id }}
         run: |
           if [ -n "$TASK_ID" ]; then
             echo "Running specific task: $TASK_ID"
