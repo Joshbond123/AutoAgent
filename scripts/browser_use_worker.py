@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """
-AutoAgent Pro — Browser Use Worker v3
-AI:      Cerebras llama3.1-8b (primary, proven fast) → qwen-3-235b fallback
-Browser: Playwright stealth + human timing
-Screenshots: Live JPEG streaming → Supabase public storage → chat UI
-CAPTCHA: NopeCHA (reCAPTCHA v2/v3, hCaptcha, Turnstile) + CF JS auto-wait
+AutoAgent Pro — Browser Agent Worker v4
+Primary AI:  Cerebras gpt-oss-120b (text reasoning)
+Vision AI:   Cloudflare Workers AI kimi-k2.6 (screenshot analysis)
+Browser:     Playwright stealth + human timing
+CAPTCHA:     NopeCHA (reCAPTCHA v2/v3, hCaptcha, CF Turnstile)
+Screenshots: Base64 JPEG → task_logs (log_type="screenshot") → realtime UI
 """
 
 import asyncio, os, sys, json, re, traceback, random, base64, time
@@ -20,24 +21,26 @@ except ImportError:
     SUPABASE_AVAILABLE = False
     print("[WARN] supabase not installed", flush=True)
 
-# ── Config ────────────────────────────────────────────────────────────────────
+# ── Config ─────────────────────────────────────────────────────────────────────
 SUPABASE_URL      = os.environ.get("SUPABASE_URL", "")
 SUPABASE_SVC_KEY  = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "")
 NOPECHA_KEY       = os.environ.get("NOPECHA_API_KEY", "")
 CEREBRAS_BASE     = "https://api.cerebras.ai/v1"
+CEREBRAS_MODELS   = ["llama3.1-8b", "qwen-3-235b-a22b-instruct-2507", "gpt-oss-120b"]
 
-# Model priority: llama3.1-8b works with this key; qwen as fallback when rate-limited
-CEREBRAS_MODELS   = ["llama3.1-8b", "qwen-3-235b-a22b-instruct-2507"]
+# Cloudflare env (overridden by user settings from DB)
+CF_ACCOUNT_ID_ENV = os.environ.get("CLOUDFLARE_ACCOUNT_ID", "")
+CF_API_KEY_ENV    = os.environ.get("CLOUDFLARE_API_KEY", "")
+CF_MODEL_ENV      = os.environ.get("CLOUDFLARE_MODEL", "@cf/moonshotai/kimi-k2.6")
 
-SCREENSHOT_BUCKET = "screenshots"
-SCREENSHOT_EVERY  = 4   # capture every N steps
+SCREENSHOT_EVERY  = 3   # capture every N steps
 
 
-# ── Cerebras Key Pool ─────────────────────────────────────────────────────────
+# ── Cerebras Key Pool ──────────────────────────────────────────────────────────
 class CerebrasPool:
     def __init__(self, keys: List[str]):
-        self.keys  = [k.strip() for k in keys if k.strip()]
-        self.idx   = 0
+        self.keys   = [k.strip() for k in keys if k.strip()]
+        self.idx    = 0
         self.failed: set = set()
 
     def next_key(self) -> Optional[str]:
@@ -55,319 +58,286 @@ class CerebrasPool:
         self.failed.add(key)
 
     @property
-    def size(self):
-        return len(self.keys)
+    def size(self): return len(self.keys)
+
+
+# ── Cloudflare AI Pool ─────────────────────────────────────────────────────────
+class CloudflarePool:
+    def __init__(self, account_id: str, keys: List[str], model: str):
+        self.account_id = account_id
+        self.keys       = [k.strip() for k in keys if k.strip()]
+        self.model      = model or "@cf/moonshotai/kimi-k2.6"
+        self.idx        = 0
+        self.failed: set = set()
+
+    def next_key(self) -> Optional[str]:
+        avail = [k for k in self.keys if k not in self.failed]
+        if not avail:
+            self.failed.clear()
+            avail = self.keys
+        if not avail:
+            return None
+        key = avail[self.idx % len(avail)]
+        self.idx = (self.idx + 1) % len(avail)
+        return key
+
+    @property
+    def ready(self): return bool(self.account_id and self.keys)
+    @property
+    def size(self): return len(self.keys)
 
 
 async def cerebras_chat(pool: CerebrasPool, messages: list,
-                        system: str = "", max_tokens: int = 800) -> str:
-    """Call Cerebras with model fallback chain."""
+                        system: str = "", max_tokens: int = 500) -> str:
+    """Call Cerebras with model fallback chain and key rotation."""
     for model in CEREBRAS_MODELS:
         for attempt in range(3):
             key = pool.next_key()
             if not key:
                 raise RuntimeError("No Cerebras keys available")
-            headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
-            body_msgs = []
-            if system:
-                body_msgs.append({"role": "system", "content": system})
-            body_msgs.extend(messages)
+            hdrs = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
+            msgs = ([{"role": "system", "content": system}] if system else []) + messages
             try:
                 async with httpx.AsyncClient(timeout=45) as c:
-                    r = await c.post(f"{CEREBRAS_BASE}/chat/completions", headers=headers, json={
-                        "model": model,
-                        "messages": body_msgs,
-                        "temperature": 0.15,
-                        "max_tokens": max_tokens,
+                    r = await c.post(f"{CEREBRAS_BASE}/chat/completions", headers=hdrs, json={
+                        "model": model, "messages": msgs, "temperature": 0.15, "max_tokens": max_tokens,
                     })
                 if r.status_code in (401, 403):
-                    pool.mark_failed(key)
-                    break
+                    pool.mark_failed(key); break
                 if r.status_code == 404:
-                    print(f"[Cerebras] {model} not available, trying next model…", flush=True)
                     break  # try next model
                 if r.status_code == 429:
-                    wait = (attempt + 1) * 3
-                    print(f"[Cerebras] Rate limited on {model}, waiting {wait}s…", flush=True)
-                    await asyncio.sleep(wait)
-                    continue
+                    await asyncio.sleep((attempt + 1) * 3); continue
                 r.raise_for_status()
                 reply = r.json()["choices"][0]["message"]["content"]
-                print(f"[Cerebras] {model} → {len(reply)} chars (key …{key[-6:]})", flush=True)
+                print(f"[Cerebras] {model} → {len(reply)} chars (…{key[-6:]})", flush=True)
                 return reply
             except Exception as e:
-                err = str(e)
-                if "404" in err or "not_found" in err.lower():
+                if "404" in str(e) or "not_found" in str(e).lower():
                     break
                 print(f"[Cerebras] {model} attempt {attempt+1}: {e}", flush=True)
-                if attempt == 2:
-                    break
+                if attempt == 2: break
     raise RuntimeError("Cerebras: all models exhausted")
 
 
-# ── Supabase Logging ──────────────────────────────────────────────────────────
-def log(task_id: str, message: str, log_type: str = "info", supabase=None, metadata: dict = None):
-    prefix = {"info": "ℹ", "success": "✓", "error": "✗", "warning": "⚠"}.get(log_type, "ℹ")
-    print(f"{prefix} {message}", flush=True)
+async def cloudflare_vision(cf: CloudflarePool, screenshot_b64: str, prompt_text: str) -> Optional[str]:
+    """Send screenshot + prompt to Cloudflare vision model, return text response."""
+    if not cf.ready:
+        return None
+    key = cf.next_key()
+    if not key:
+        return None
+    url = f"https://api.cloudflare.com/client/v4/accounts/{cf.account_id}/ai/run/{cf.model}"
+    hdrs = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
+    body = {
+        "messages": [{
+            "role": "user",
+            "content": [
+                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{screenshot_b64}"}},
+                {"type": "text", "text": prompt_text},
+            ],
+        }]
+    }
+    try:
+        async with httpx.AsyncClient(timeout=60) as c:
+            r = await c.post(url, headers=hdrs, json=body)
+        if r.status_code == 429:
+            cf.failed.add(key)
+            return None
+        r.raise_for_status()
+        data = r.json()
+        return data.get("result", {}).get("response", "")
+    except Exception as e:
+        print(f"[Cloudflare] Vision error: {e}", flush=True)
+        return None
+
+
+async def cloudflare_text(cf: CloudflarePool, messages: list, system: str = "") -> Optional[str]:
+    """Call Cloudflare AI with text-only messages (fallback when Cerebras fails)."""
+    if not cf.ready:
+        return None
+    key = cf.next_key()
+    if not key:
+        return None
+    url = f"https://api.cloudflare.com/client/v4/accounts/{cf.account_id}/ai/run/{cf.model}"
+    hdrs = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
+    msgs = ([{"role": "system", "content": system}] if system else []) + messages
+    try:
+        async with httpx.AsyncClient(timeout=60) as c:
+            r = await c.post(url, headers=hdrs, json={"messages": msgs})
+        if r.status_code == 429:
+            cf.failed.add(key)
+            return None
+        r.raise_for_status()
+        return r.json().get("result", {}).get("response", "")
+    except Exception as e:
+        print(f"[Cloudflare] Text error: {e}", flush=True)
+        return None
+
+
+# ── Supabase Logging ───────────────────────────────────────────────────────────
+def log(task_id: str, message: str, log_type: str = "info", supabase=None):
+    icons = {"info": "ℹ", "success": "✓", "error": "✗", "warning": "⚠", "screenshot": "📸"}
+    print(f"{icons.get(log_type, 'ℹ')} {message[:200]}", flush=True)
     if supabase and task_id:
         try:
-            row = {
+            supabase.table("task_logs").insert({
                 "task_id":    task_id,
                 "message":    message,
                 "log_type":   log_type,
                 "created_at": datetime.utcnow().isoformat(),
-            }
-            if metadata:
-                row["metadata"] = metadata
-            supabase.table("task_logs").insert(row).execute()
+            }).execute()
         except Exception as e:
-            print(f"[WARN] log persist: {e}", flush=True)
+            print(f"[WARN] log: {e}", flush=True)
 
 
-# ── Screenshot Upload ─────────────────────────────────────────────────────────
-async def upload_screenshot(page, task_id: str, step: int, label: str,
-                             supabase=None) -> Optional[str]:
-    """Capture page screenshot, upload to Supabase Storage, return public URL."""
+def log_screenshot(task_id: str, b64: str, label: str, supabase=None):
+    """Store screenshot as base64 in task_logs with log_type=screenshot."""
+    print(f"📸 Screenshot: {label}", flush=True)
+    if supabase and task_id:
+        try:
+            supabase.table("task_logs").insert({
+                "task_id":    task_id,
+                "message":    b64,  # raw base64 — UI renders as <img>
+                "log_type":   "screenshot",
+                "created_at": datetime.utcnow().isoformat(),
+            }).execute()
+        except Exception as e:
+            print(f"[WARN] screenshot log: {e}", flush=True)
+
+
+# ── Screenshot Capture ─────────────────────────────────────────────────────────
+async def capture_screenshot(page, task_id: str, step: int, label: str, supabase=None) -> Optional[str]:
     try:
-        screenshot_bytes = await page.screenshot(type="jpeg", quality=65,
-                                                  full_page=False, timeout=8000)
-        path = f"task_{task_id[:8]}/step_{step:03d}_{int(time.time())}.jpg"
-
-        if supabase:
-            supabase.storage.from_(SCREENSHOT_BUCKET).upload(
-                path, screenshot_bytes,
-                file_options={"content-type": "image/jpeg", "upsert": "true"}
-            )
-            public_url = (
-                f"{SUPABASE_URL}/storage/v1/object/public/{SCREENSHOT_BUCKET}/{path}"
-            )
-            log(task_id, f"SCREENSHOT: {public_url}", "info", supabase,
-                metadata={"step": step, "label": label})
-            return public_url
-        else:
-            # Fallback: embed base64 directly (visible in chat UI too)
-            b64 = base64.b64encode(screenshot_bytes).decode()
-            data_url = f"data:image/jpeg;base64,{b64}"
-            log(task_id, data_url, "info", supabase)
-            return data_url
+        buf = await page.screenshot(type="jpeg", quality=65, full_page=False, timeout=8000)
+        b64 = base64.b64encode(buf).decode()
+        log_screenshot(task_id, b64, label, supabase)
+        return b64
     except Exception as e:
-        print(f"[Screenshot] Error at step {step}: {e}", flush=True)
+        print(f"[Screenshot] Step {step}: {e}", flush=True)
         return None
 
 
-# ── CAPTCHA Handler ───────────────────────────────────────────────────────────
+# ── CAPTCHA Handler ────────────────────────────────────────────────────────────
 async def handle_captcha(page, task_id: str, supabase=None, nopecha_key: str = "") -> bool:
-    """Detect and solve CAPTCHA on current page."""
     try:
         content = await page.content()
         url = page.url
 
-        # Cloudflare JS challenge — just wait
-        if "Just a moment" in content or "Checking your browser" in content or \
-           ("cf-browser-verification" in content and "cloudflare" in content.lower()):
-            log(task_id, "🛡️ Cloudflare JS challenge detected — waiting 15s for auto-resolve…",
-                "warning", supabase)
+        # Cloudflare JS challenge
+        if ("Just a moment" in content or "Checking your browser" in content or
+                ("cf-browser-verification" in content and "cloudflare" in content.lower())):
+            log(task_id, "🛡️ Cloudflare challenge detected — waiting 15s…", "warning", supabase)
             await asyncio.sleep(15)
             new_content = await page.content()
-            if "Just a moment" not in new_content and "Checking your browser" not in new_content:
-                log(task_id, "✅ Cloudflare JS challenge passed!", "success", supabase)
-                return True
-            log(task_id, "⚠️ Cloudflare still blocking — continuing anyway", "warning", supabase)
+            passed = "Just a moment" not in new_content and "Checking your browser" not in new_content
+            log(task_id, "✅ CF challenge passed!" if passed else "⚠️ CF still blocking — continuing", "success" if passed else "warning", supabase)
             return True
 
         if not nopecha_key:
-            # Still detect and report — just can't solve
-            if "g-recaptcha" in content or "hcaptcha" in content.lower() or "turnstile" in content.lower():
-                sitekey_m = re.search(r'data-sitekey=["\']([^"\']+)["\']', content)
-                captcha_type = "reCAPTCHA v2"
-                if "hcaptcha" in content.lower(): captcha_type = "hCaptcha"
-                elif "turnstile" in content.lower(): captcha_type = "Turnstile"
-                sk = sitekey_m.group(1)[:20] if sitekey_m else "unknown"
-                log(task_id, f"🔐 {captcha_type} detected (sitekey: {sk}…) — NopeCHA key not configured",
-                    "warning", supabase)
+            if any(x in content.lower() for x in ["g-recaptcha", "hcaptcha", "cf-turnstile", "turnstile"]):
+                log(task_id, "🔐 CAPTCHA detected (NopeCHA key not configured)", "warning", supabase)
             return False
 
-        sitekey_match = re.search(r'data-sitekey=["\']([^"\']+)["\']', content)
-        if not sitekey_match:
+        sitekey_m = re.search(r'data-sitekey=["\']([^"\']+)["\']', content)
+        if not sitekey_m:
             return False
 
-        sitekey = sitekey_match.group(1)
-        if "hcaptcha" in content.lower():
-            captcha_type = "hcaptcha"
-        elif "turnstile" in content.lower():
-            captcha_type = "turnstile"
-        elif "recaptcha/api2" in content or "recaptcha/enterprise" in content:
-            captcha_type = "recaptchav2"
-        else:
-            captcha_type = "recaptchav2"
+        sitekey = sitekey_m.group(1)
+        if "hcaptcha" in content.lower():   ctype = "hcaptcha"
+        elif "turnstile" in content.lower(): ctype = "turnstile"
+        else:                                ctype = "recaptchav2"
 
-        log(task_id, f"🔐 {captcha_type.upper()} detected — solving via NopeCHA…", "info", supabase)
+        log(task_id, f"🔐 {ctype.upper()} detected — solving via NopeCHA…", "info", supabase)
 
         async with httpx.AsyncClient(timeout=180) as client:
             res = await client.post("https://api.nopecha.com/", json={
-                "type":    captcha_type,
-                "sitekey": sitekey,
-                "url":     url,
-                "key":     nopecha_key,
+                "type": ctype, "sitekey": sitekey, "url": url, "key": nopecha_key,
             })
             data = res.json()
             if data.get("error"):
-                log(task_id, f"CAPTCHA submit error: {data['error']}", "warning", supabase)
+                log(task_id, f"NopeCHA error: {data['error']}", "warning", supabase)
                 return False
 
             captcha_id = data.get("id")
-            log(task_id, f"CAPTCHA task submitted (id: {captcha_id}) — polling…", "info", supabase)
-
-            for poll_n in range(80):
+            for _ in range(80):
                 await asyncio.sleep(3)
-                p = await client.get("https://api.nopecha.com/",
-                                     params={"key": nopecha_key, "id": captcha_id})
+                p = await client.get("https://api.nopecha.com/", params={"key": nopecha_key, "id": captcha_id})
                 pd = p.json()
                 if not pd.get("error") and pd.get("data"):
                     token = pd["data"][0] if isinstance(pd["data"], list) else pd["data"]
-                    # Inject token
-                    if captcha_type == "hcaptcha":
-                        await page.evaluate(f"""
-                            (() => {{
-                              const r = document.querySelector('[name="h-captcha-response"]');
-                              if(r) r.value = '{token}';
-                              if(window.hcaptcha) window.hcaptcha.execute = ()=>Promise.resolve('{token}');
-                            }})()
-                        """)
-                    elif captcha_type == "turnstile":
-                        await page.evaluate(f"""
-                            (() => {{
-                              const r = document.querySelector('[name="cf-turnstile-response"]');
-                              if(r) r.value = '{token}';
-                            }})()
-                        """)
+                    if ctype == "hcaptcha":
+                        await page.evaluate(f"(() => {{ const r=document.querySelector('[name=\"h-captcha-response\"]'); if(r) r.value='{token}'; }})();")
+                    elif ctype == "turnstile":
+                        await page.evaluate(f"(() => {{ const r=document.querySelector('[name=\"cf-turnstile-response\"]'); if(r) r.value='{token}'; }})();")
                     else:
-                        await page.evaluate(f"""
-                            (() => {{
-                              const r = document.getElementById('g-recaptcha-response');
-                              if(r) r.innerHTML = '{token}';
-                              if(typeof ___grecaptcha_cfg !== 'undefined') {{
-                                Object.values(___grecaptcha_cfg.clients||{{}}).forEach(c => {{
-                                  try {{ const cb = c?.DDD?.callback || c?.l?.callback;
-                                         if(typeof cb === 'function') cb('{token}'); }} catch(e) {{}}
-                                }});
-                              }}
-                            }})()
-                        """)
-                    log(task_id, f"✅ CAPTCHA solved and token injected! (attempt {poll_n+1})",
-                        "success", supabase)
+                        await page.evaluate(f"(() => {{ const r=document.getElementById('g-recaptcha-response'); if(r) r.innerHTML='{token}'; }})();")
+                    log(task_id, "✅ CAPTCHA solved and token injected!", "success", supabase)
                     return True
 
-        log(task_id, "⏰ CAPTCHA solve timeout (4 minutes)", "warning", supabase)
+        log(task_id, "⏰ CAPTCHA timeout", "warning", supabase)
         return False
-
     except Exception as e:
-        log(task_id, f"CAPTCHA handler error: {e}", "warning", supabase)
+        log(task_id, f"CAPTCHA error: {e}", "warning", supabase)
         return False
 
 
-# ── Page Context Gatherer ─────────────────────────────────────────────────────
+# ── Page Context ───────────────────────────────────────────────────────────────
 async def get_page_context(page, prompt: str, memory: List[str],
-                           completed_extracts: List[str] = None,
-                           last_extract_url: str = "") -> str:
-    """Build rich page context for Cerebras decision making."""
-    if completed_extracts is None:
-        completed_extracts = []
+                            completed_extracts: List[str], last_extract_url: str = "") -> str:
     try:
         ctx = await page.evaluate("""() => {
-            const getText = (el) => el ? (el.innerText || el.textContent || '').trim() : '';
-            const bodyText = getText(document.body).slice(0, 2500);
-            const inputs = Array.from(document.querySelectorAll(
-                'input:not([type=hidden]):not([type=submit]):not([type=button]),textarea,select'
-            )).slice(0,12).map(e => ({
-                tag: e.tagName, type: e.type||'', name: e.name||'', id: e.id||'',
-                placeholder: e.placeholder||'', value: (e.value||'').slice(0,30),
-                'aria-label': e.getAttribute('aria-label')||''
-            }));
-            const buttons = Array.from(document.querySelectorAll(
-                'button,input[type=submit],input[type=button],[role=button]'
-            )).slice(0,12).map(e => ({
-                tag: e.tagName, id: e.id||'', class: (e.className||'').slice(0,40),
-                text: getText(e).slice(0,60)
-            }));
-            const links = Array.from(document.querySelectorAll('a[href]'))
-                .slice(0,10).map(a => ({ text: getText(a).slice(0,50), href: a.href }));
-            const headings = Array.from(document.querySelectorAll('h1,h2,h3'))
-                .slice(0,5).map(h => getText(h));
-            const errors = Array.from(document.querySelectorAll(
-                '[class*=error],[class*=alert],[role=alert],[class*=warning]'
-            )).slice(0,3).map(e => getText(e).slice(0,100));
-            return { url: location.href, title: document.title,
-                     bodyText, inputs, buttons, links, headings, errors };
+            const getText = el => el ? (el.innerText || el.textContent || '').trim() : '';
+            return {
+                url:      location.href,
+                title:    document.title,
+                bodyText: getText(document.body).slice(0, 2500),
+                inputs:   Array.from(document.querySelectorAll('input:not([type=hidden]):not([type=submit]),textarea,select'))
+                              .slice(0,10).map(e => ({ tag:e.tagName, type:e.type||'', name:e.name||'', id:e.id||'', placeholder:e.placeholder||'' })),
+                buttons:  Array.from(document.querySelectorAll('button,input[type=submit],[role=button]'))
+                              .slice(0,10).map(e => ({ tag:e.tagName, id:e.id||'', text:getText(e).slice(0,60) })),
+                links:    Array.from(document.querySelectorAll('a[href]'))
+                              .slice(0,8).map(a => ({ text:getText(a).slice(0,50), href:a.href })),
+                headings: Array.from(document.querySelectorAll('h1,h2,h3')).slice(0,5).map(getText),
+                errors:   Array.from(document.querySelectorAll('[class*=error],[role=alert]')).slice(0,3).map(e => getText(e).slice(0,80)),
+            };
         }""")
     except Exception:
-        ctx = {"url": page.url, "title": "Unknown", "bodyText": "",
-               "inputs": [], "buttons": [], "links": [], "headings": [], "errors": []}
+        ctx = {"url": page.url, "title": "Unknown", "bodyText": "", "inputs": [], "buttons": [], "links": [], "headings": [], "errors": []}
 
-    mem_str = ""
-    if memory:
-        mem_str = "\nEXTRACTED SO FAR:\n" + "\n".join(f"  • {m[:200]}" for m in memory[-6:])
-
-    completed_str = ""
-    if completed_extracts:
-        completed_str = f"\nCOMPLETED STEPS: {', '.join(completed_extracts)} — these are DONE, do NOT re-extract them. Move to the NEXT step."
-
-    next_hint = ""
-    if completed_extracts and last_extract_url == ctx.get('url', ''):
-        next_hint = "\n⚡ IMPORTANT: You already collected data on this page. Your next action MUST be GOTO (navigate to the next URL in the task) or FINISH if all data is collected."
+    mem_str = ("\nEXTRACTED SO FAR:\n" + "\n".join(f"  • {m[:200]}" for m in memory[-6:])) if memory else ""
+    done_str = f"\nCOMPLETED STEPS: {', '.join(completed_extracts)} — DONE, do NOT re-extract." if completed_extracts else ""
+    next_hint = "\n⚡ IMPORTANT: Data already collected on this page — GOTO next URL or FINISH." \
+        if completed_extracts and last_extract_url == ctx.get("url", "") else ""
 
     return f"""URL: {ctx['url']}
 TITLE: {ctx['title']}
 HEADINGS: {' | '.join(ctx.get('headings', [])[:3])}
-PAGE TEXT (first 1500 chars):
-{ctx.get('bodyText', '')[:1500]}
+PAGE TEXT:\n{ctx.get('bodyText', '')[:1500]}
 INPUTS: {json.dumps(ctx.get('inputs', [])[:6])}
+BUTTONS: {json.dumps(ctx.get('buttons', [])[:8])}
 LINKS: {json.dumps(ctx.get('links', [])[:6])}
-TASK: {prompt}{completed_str}{mem_str}{next_hint}"""
+ERRORS: {' | '.join(ctx.get('errors', []))}
+TASK: {prompt}{done_str}{mem_str}{next_hint}"""
 
 
-# ── Bulletproof JSON Extractor ────────────────────────────────────────────────
+# ── JSON Extractor ─────────────────────────────────────────────────────────────
 def extract_action_json(raw: str) -> Optional[dict]:
-    """
-    Extract a valid action JSON object from Cerebras output.
-    Handles: markdown code blocks, single quotes, trailing commas,
-             Python-style True/False/None, extra whitespace.
-    """
-    text = raw.strip()
+    text = re.sub(r'^```(?:json)?\s*', '', raw.strip(), flags=re.MULTILINE)
+    text = re.sub(r'```\s*$', '', text, flags=re.MULTILINE).strip()
 
-    # 1. Strip markdown code fences
-    text = re.sub(r'^```(?:json)?\s*', '', text, flags=re.MULTILINE)
-    text = re.sub(r'```\s*$', '', text, flags=re.MULTILINE)
-    text = text.strip()
-
-    # 2. Try to find JSON object boundaries
-    patterns = [
-        r'\{[^{}]*"action"\s*:[^{}]*\}',       # strict: action key inside {}
-        r'\{[^{}]*\}',                            # any {} block
-        r'\{.*?\}',                               # fallback: first {}
-    ]
     candidates = []
-    for pat in patterns:
-        m = re.search(pat, text, re.DOTALL)
-        if m:
-            candidates.append(m.group())
-
-    # Also try the whole text if it looks like JSON
     if text.startswith('{') and text.endswith('}'):
-        candidates.insert(0, text)
+        candidates.append(text)
+    for pat in [r'\{[^{}]*"action"\s*:[^{}]*\}', r'\{[^{}]*\}', r'\{.*?\}']:
+        m = re.search(pat, text, re.DOTALL)
+        if m: candidates.append(m.group())
 
     for raw_json in candidates:
-        # Fix common issues
-        fixed = raw_json
-        # Remove trailing commas before } or ]
-        fixed = re.sub(r',\s*([}\]])', r'\1', fixed)
-        # Replace single-quote strings with double quotes (simple cases)
+        fixed = re.sub(r',\s*([}\]])', r'\1', raw_json)
         fixed = re.sub(r"'([^']*)'", r'"\1"', fixed)
-        # Fix Python booleans/None
         fixed = fixed.replace('True', 'true').replace('False', 'false').replace('None', 'null')
-        # Remove JS-style comments
         fixed = re.sub(r'//[^\n]*', '', fixed)
-
         try:
             obj = json.loads(fixed)
             if isinstance(obj, dict) and 'action' in obj:
@@ -375,30 +345,28 @@ def extract_action_json(raw: str) -> Optional[dict]:
         except Exception:
             pass
 
-    # Last resort: look for action keyword and build minimal JSON
     action_m = re.search(r'"action"\s*:\s*"(\w+)"', text)
     if action_m:
         reason_m = re.search(r'"reason"\s*:\s*"([^"]*)"', text)
-        return {
-            "action": action_m.group(1).upper(),
-            "reason": reason_m.group(1) if reason_m else "AI decision (JSON repaired)",
-        }
-
+        return {"action": action_m.group(1).upper(), "reason": reason_m.group(1) if reason_m else "repaired"}
     return None
 
 
-# ── Main Playwright Agent ─────────────────────────────────────────────────────
-async def run_agent(task_id: str, prompt: str, pool: Optional[CerebrasPool],
-                    supabase=None) -> dict:
+# ── Main Agent Loop ────────────────────────────────────────────────────────────
+async def run_agent(task_id: str, prompt: str,
+                    cerebras_pool: Optional[CerebrasPool],
+                    cf_pool: Optional[CloudflarePool],
+                    supabase=None, nopecha_key: str = "") -> dict:
     from playwright.async_api import async_playwright
 
-    log(task_id, "🚀 AutoAgent Pro — Playwright stealth browser starting…", "info", supabase)
-    log(task_id, f"📋 Task: {prompt[:120]}…" if len(prompt)>120 else f"📋 Task: {prompt}", "info", supabase)
-    if pool:
-        log(task_id, f"🧠 Cerebras AI ready — {pool.size} key(s), models: {', '.join(CEREBRAS_MODELS)}",
-            "info", supabase)
+    log(task_id, "🚀 AutoAgent Pro — stealth browser starting…", "info", supabase)
+    log(task_id, f"📋 Task: {prompt[:120]}{'…' if len(prompt) > 120 else ''}", "info", supabase)
+    if cerebras_pool:
+        log(task_id, f"⚡ Cerebras ready — {cerebras_pool.size} key(s)", "info", supabase)
+    if cf_pool and cf_pool.ready:
+        log(task_id, f"☁️ Cloudflare AI ready — {cf_pool.size} key(s), model: {cf_pool.model}", "info", supabase)
 
-    memory: List[str] = []   # extracted data memory across steps
+    memory: List[str] = []
     steps_done = 0
     max_steps  = 30
     final_summary = ""
@@ -407,192 +375,195 @@ async def run_agent(task_id: str, prompt: str, pool: Optional[CerebrasPool],
         browser = await p.chromium.launch(
             headless=True,
             args=[
-                "--no-sandbox",
+                "--no-sandbox", "--disable-setuid-sandbox",
                 "--disable-blink-features=AutomationControlled",
-                "--disable-dev-shm-usage",
-                "--disable-gpu",
-                "--window-size=1366,768",
-                "--disable-extensions",
-                "--disable-default-apps",
+                "--disable-dev-shm-usage", "--disable-gpu",
+                "--window-size=1366,768", "--disable-extensions",
+                "--disable-infobars", "--disable-default-apps",
+                "--no-first-run",
             ]
         )
-        context = await browser.new_context(
+        ctx = await browser.new_context(
             viewport={"width": 1366, "height": 768},
             user_agent=(
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/124.0.0.0 Safari/537.36"
+                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
             ),
             locale="en-US",
             timezone_id="America/New_York",
             extra_http_headers={
-                "Accept-Language": "en-US,en;q=0.9",
-                "Accept":          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Accept-Language":  "en-US,en;q=0.9",
+                "Accept":           "text/html,application/xhtml+xml,*/*;q=0.8",
+                "sec-ch-ua":        '"Chromium";v="124","Google Chrome";v="124"',
+                "sec-ch-ua-mobile": "?0",
             },
         )
-        # Anti-detection
-        await context.add_init_script("""
-            Object.defineProperty(navigator, 'webdriver', { get: () => false });
-            Object.defineProperty(navigator, 'plugins', { get: () => [1,2,3,4,5] });
-            Object.defineProperty(navigator, 'languages', { get: () => ['en-US','en'] });
+        await ctx.add_init_script("""
+            Object.defineProperty(navigator, 'webdriver',    { get: () => false });
+            Object.defineProperty(navigator, 'plugins',      { get: () => [1,2,3,4,5] });
+            Object.defineProperty(navigator, 'languages',    { get: () => ['en-US','en'] });
+            Object.defineProperty(navigator, 'hardwareConcurrency', { get: () => 8 });
             window.chrome = { runtime: {} };
+            const origQuery = window.navigator.permissions.query;
+            window.navigator.permissions.query = (p) =>
+                p.name === 'notifications'
+                    ? Promise.resolve({ state: 'denied' })
+                    : origQuery(p);
         """)
 
-        page = await context.new_page()
+        page = await ctx.new_page()
 
-        # Navigate to first URL in prompt
-        url_match = re.search(r'https?://[^\s\'"]+', prompt)
+        # Initial navigation
+        url_match = re.search(r'https?://[^\s\'"<>)]+', prompt)
         start_url = url_match.group() if url_match else "https://www.google.com"
         log(task_id, f"🌐 Navigating to {start_url}", "info", supabase)
         try:
             await page.goto(start_url, wait_until="domcontentloaded", timeout=30000)
             await asyncio.sleep(random.uniform(1.2, 2.5))
         except Exception as e:
-            log(task_id, f"Initial navigation error: {e}", "warning", supabase)
+            log(task_id, f"Navigation error: {e}", "warning", supabase)
 
-        # Check for CAPTCHA on first load
-        captcha_result = await handle_captcha(page, task_id, supabase, NOPECHA_KEY)
-        if captcha_result:
-            await asyncio.sleep(2)
+        await handle_captcha(page, task_id, supabase, nopecha_key)
+        await capture_screenshot(page, task_id, 0, "Initial page load", supabase)
 
-        # Take opening screenshot
-        await upload_screenshot(page, task_id, 0, "Initial page load", supabase)
+        # Agent loop vars
+        recent_actions:    List[str] = []
+        consecutive_waits: int       = 0
+        completed_extracts: List[str] = []
+        last_extract_url:  str        = ""
+        extracted_urls:    List[str]  = []
 
-        # ── Agent Loop ───────────────────────────────────────────────────────
-        recent_actions: List[str] = []   # loop detection buffer
-        consecutive_waits = 0
-        completed_extracts: List[str] = []  # labels successfully extracted
-        last_extract_url: str = ""          # URL where last extract happened
-        extracted_urls: List[str] = []      # URLs where data was successfully extracted
+        SYSTEM_PROMPT = """You are AutoAgent Pro, an autonomous web browsing AI.
+Output ONLY a single JSON object. No markdown. No explanation. Just the JSON.
+
+ACTIONS (pick ONE):
+{"action":"GOTO","url":"https://example.com","reason":"why"}
+{"action":"CLICK","selector":"a.link","reason":"why"}
+{"action":"TYPE","selector":"#search","text":"query","reason":"why"}
+{"action":"PRESS_KEY","key":"Enter","reason":"why"}
+{"action":"SCROLL","scrollY":500,"reason":"why"}
+{"action":"EXTRACT","js":"document.body.innerText","label":"name","reason":"why"}
+{"action":"WAIT","ms":2000,"reason":"why"}
+{"action":"FINISH","summary":"full summary of ALL data collected","reason":"done"}
+
+RULES:
+- Output ONLY valid JSON starting with { ending with }
+- Use DOUBLE QUOTES for all strings
+- GOTO MUST include the full "url" field
+- After extracting data, GOTO next URL or FINISH
+- FINISH when ALL required data is collected"""
 
         while steps_done < max_steps:
             steps_done += 1
             current_url = page.url
-            log(task_id, f"⚙️ Step {steps_done}/{max_steps} — {current_url[:70]}", "info", supabase)
+            log(task_id, f"⚙️ Step {steps_done}/{max_steps} — {current_url[:80]}", "info", supabase)
 
             # Screenshot every N steps
+            ss_b64 = None
             if steps_done % SCREENSHOT_EVERY == 0:
-                await upload_screenshot(page, task_id, steps_done, f"Step {steps_done}", supabase)
+                ss_b64 = await capture_screenshot(page, task_id, steps_done, f"Step {steps_done}", supabase)
 
-            # Check CAPTCHA each step
-            await handle_captcha(page, task_id, supabase, NOPECHA_KEY)
+            # Check CAPTCHA
+            await handle_captcha(page, task_id, supabase, nopecha_key)
 
-            # ── Loop Detection ────────────────────────────────────────────────
-            # If last 4 actions were identical, force a FINISH with what we have
+            # Loop detection
             if len(recent_actions) >= 4 and len(set(recent_actions[-4:])) == 1:
-                loop_summary = f"Loop detected — agent repeated same action 4x. Memory: {' | '.join(memory)}"
-                log(task_id, f"⚠️ Loop detected — forcing completion", "warning", supabase)
-                final_summary = loop_summary
-                await upload_screenshot(page, task_id, steps_done, "Loop detected - stopping", supabase)
+                log(task_id, "⚠️ Loop detected — forcing finish", "warning", supabase)
+                final_summary = f"Loop detected after {steps_done} steps. Collected: {' | '.join(memory)}"
                 break
-
-            # If consecutive WAITs > 5, something is wrong — break
             if consecutive_waits >= 5:
-                log(task_id, "⚠️ Too many WAITs — forcing completion with collected data", "warning", supabase)
-                final_summary = f"Partial completion after {steps_done} steps. Memory: {' | '.join(memory)}"
+                log(task_id, "⚠️ Too many WAITs — forcing finish", "warning", supabase)
+                final_summary = f"Timeout after {steps_done} steps. Collected: {' | '.join(memory)}"
                 break
 
-            # Build page context
-            page_ctx = await get_page_context(page, prompt, memory,
-                                              completed_extracts, last_extract_url)
-
-            # Ask Cerebras for next action
+            # Decide next action
             action: Optional[dict] = None
-            if pool:
+            loop_hint = ""
+            if consecutive_waits >= 2:
+                loop_hint = f"\n⚠️ Output ONLY raw JSON — no text before or after."
+            if len(recent_actions) >= 3 and len(set(recent_actions[-3:])) == 1:
+                loop_hint += f"\n⚠️ Same action repeated — try a DIFFERENT action type."
+
+            page_ctx = await get_page_context(page, prompt, memory, completed_extracts, last_extract_url)
+            system = SYSTEM_PROMPT + loop_hint
+
+            # 1) Try Cerebras (primary)
+            if cerebras_pool:
                 try:
-                    # Build loop-awareness hint
-                    loop_hint = ""
-                    if consecutive_waits >= 2:
-                        loop_hint = f"\n⚠️ IMPORTANT: Last {consecutive_waits} responses had JSON errors. You MUST output ONLY a raw JSON object starting with {{ and ending with }}. No text before or after."
-                    if len(recent_actions) >= 3 and len(set(recent_actions[-3:])) == 1:
-                        loop_hint += f"\n⚠️ IMPORTANT: You have repeated the same action {len(recent_actions[-3:])}x in a row. Try a DIFFERENT action type."
-
-                    system_prompt = f"""You are AutoAgent Pro, an autonomous web browsing AI.
-Output ONLY a single JSON object. No markdown. No explanation. Just the JSON.
-
-ACTIONS (pick ONE — include ALL required fields):
-{{"action":"GOTO","url":"https://example.com","reason":"why"}}          <- url is REQUIRED
-{{"action":"CLICK","selector":"a.link","reason":"why"}}                  <- selector is REQUIRED
-{{"action":"TYPE","selector":"#search","text":"query","reason":"why"}}   <- selector+text REQUIRED
-{{"action":"PRESS_KEY","key":"Enter","reason":"why"}}
-{{"action":"SCROLL","scrollY":500,"reason":"why"}}
-{{"action":"EXTRACT","js":"document.body.innerText","label":"name","reason":"why"}} <- js+label REQUIRED
-{{"action":"WAIT","ms":2000,"reason":"why"}}
-{{"action":"FINISH","summary":"full summary of all data collected","reason":"done"}}
-
-CRITICAL RULES:
-- Output ONLY valid JSON starting with {{ ending with }}
-- Use DOUBLE QUOTES for all strings — never single quotes
-- GOTO MUST include the full "url" field — e.g. "url":"https://httpbin.org/ip"
-- EXTRACT MUST include "js" field (JavaScript expression) and "label" field
-- After extracting data from a page, GOTO the next URL immediately — do NOT re-extract
-- Use FINISH when ALL required data is collected{loop_hint}"""
-
-                    response = await cerebras_chat(
-                        pool,
-                        [{"role": "user", "content": page_ctx}],
-                        system=system_prompt,
-                        max_tokens=400,
-                    )
-
-                    # ── Bulletproof JSON extraction ────────────────────────
-                    action = extract_action_json(response)
-
+                    raw = await cerebras_chat(cerebras_pool, [{"role": "user", "content": page_ctx}], system=system, max_tokens=400)
+                    action = extract_action_json(raw)
                 except Exception as e:
-                    log(task_id, f"⚠️ AI error: {str(e)[:100]}", "warning", supabase)
+                    log(task_id, f"⚠️ Cerebras error: {str(e)[:80]}", "warning", supabase)
+
+            # 2) Cloudflare text fallback
+            if not action and cf_pool and cf_pool.ready:
+                try:
+                    raw = await cloudflare_text(cf_pool, [{"role": "user", "content": page_ctx}], system=system)
+                    if raw:
+                        action = extract_action_json(raw)
+                        if action:
+                            log(task_id, "☁️ Cloudflare AI fallback used", "info", supabase)
+                except Exception as e:
+                    log(task_id, f"⚠️ Cloudflare fallback error: {str(e)[:80]}", "warning", supabase)
+
+            # 3) Cloudflare vision (when screenshot available & text reasoning failed)
+            if not action and cf_pool and cf_pool.ready and ss_b64:
+                try:
+                    vision_prompt = (
+                        f"OBJECTIVE: {prompt}\n"
+                        f"URL: {page.url}\nStep: {steps_done}\n\n"
+                        f"Analyse this screenshot and return ONE JSON action:\n"
+                        f'{{\"action\":\"CLICK|TYPE|GOTO|SCROLL|EXTRACT|FINISH\",\"selector\":\"CSS\",\"text\":\"\",\"url\":\"\",\"reason\":\"why\"}}\n'
+                        f"Raw JSON only."
+                    )
+                    raw = await cloudflare_vision(cf_pool, ss_b64, vision_prompt)
+                    if raw:
+                        action = extract_action_json(raw)
+                        if action:
+                            log(task_id, "👁️ Cloudflare Vision used for decision", "info", supabase)
+                except Exception as e:
+                    log(task_id, f"⚠️ Vision error: {str(e)[:80]}", "warning", supabase)
 
             if not action:
-                action = {"action": "WAIT", "ms": 2000, "reason": "awaiting AI response"}
+                action = {"action": "WAIT", "ms": 2000, "reason": "AI unavailable"}
 
             action_type = action.get("action", "WAIT").upper()
             reason      = action.get("reason", "")
-            log(task_id, f"🤖 {action_type}: {reason[:120]}", "info", supabase)
+            log(task_id, f"🤖 {action_type}: {reason[:100]}", "info", supabase)
 
-            # Track for loop detection
-            action_key = action_type + ":" + str(action.get("url", action.get("selector", "")))[:50]
+            # Track loops
+            action_key = f"{action_type}:{str(action.get('url', action.get('selector', '')))[:50]}"
             recent_actions.append(action_key)
-            if len(recent_actions) > 8:
-                recent_actions.pop(0)
+            if len(recent_actions) > 8: recent_actions.pop(0)
             consecutive_waits = consecutive_waits + 1 if action_type == "WAIT" else 0
 
-            # ── Execute Action ────────────────────────────────────────────────
+            # ── Execute ───────────────────────────────────────────────────────
             if action_type == "FINISH":
                 summary = action.get("summary", reason)
                 final_summary = summary
                 log(task_id, f"✅ Task complete!\n{summary[:600]}", "success", supabase)
-                # Final screenshot
-                await upload_screenshot(page, task_id, steps_done, "Task completed", supabase)
+                await capture_screenshot(page, task_id, steps_done, "Task completed", supabase)
                 break
 
             elif action_type == "GOTO":
-                target_url = action.get("url", "")
-                # Fallback: if model forgot the url field, extract next unextracted URL from prompt
-                if not target_url:
+                target = action.get("url", "")
+                if not target:
                     all_urls = re.findall(r'https?://[^\s\'"<>)]+', prompt)
-                    current = page.url.rstrip('/')
-                    # Priority 1: URLs not yet extracted at all
-                    unextracted = [u for u in all_urls
-                                   if u.rstrip('/') not in extracted_urls
-                                   and u.rstrip('/') != current]
-                    # Priority 2: any URL different from current
-                    different = [u for u in all_urls if u.rstrip('/') != current]
+                    cur = page.url.rstrip('/')
+                    unextracted = [u for u in all_urls if u.rstrip('/') not in extracted_urls and u.rstrip('/') != cur]
+                    different   = [u for u in all_urls if u.rstrip('/') != cur]
                     chosen = (unextracted or different or [None])[0]
-                    if chosen:
-                        target_url = chosen
-                        log(task_id, f"⚠️ GOTO missing url — auto-selected: {target_url[:60]}", "warning", supabase)
-                if target_url:
+                    if chosen: target = chosen; log(task_id, f"⚠️ GOTO missing url — auto: {target[:60]}", "warning", supabase)
+                if target:
                     try:
-                        log(task_id, f"🌐 Navigating to {target_url[:80]}", "info", supabase)
-                        await page.goto(target_url, wait_until="domcontentloaded", timeout=30000)
-                        await asyncio.sleep(random.uniform(0.9, 2.1))
-                        await handle_captcha(page, task_id, supabase, NOPECHA_KEY)
-                        await upload_screenshot(page, task_id, steps_done, f"Navigated to {target_url[:40]}", supabase)
-                        # Reset action tracker so loop detector doesn't fire on valid navigation
+                        log(task_id, f"🌐 Navigating to {target[:80]}", "info", supabase)
+                        await page.goto(target, wait_until="domcontentloaded", timeout=30000)
+                        await asyncio.sleep(random.uniform(1.0, 2.3))
+                        await handle_captcha(page, task_id, supabase, nopecha_key)
+                        await capture_screenshot(page, task_id, steps_done, f"After GOTO {target[:40]}", supabase)
                         recent_actions.clear()
                     except Exception as e:
-                        log(task_id, f"Navigation error: {str(e)[:100]}", "warning", supabase)
-                else:
-                    log(task_id, "⚠️ GOTO action has no url and no URLs found in prompt", "warning", supabase)
+                        log(task_id, f"Navigation error: {str(e)[:80]}", "warning", supabase)
 
             elif action_type == "CLICK":
                 selector = action.get("selector", "")
@@ -600,127 +571,106 @@ CRITICAL RULES:
                     try:
                         el = await page.wait_for_selector(selector, timeout=10000, state="visible")
                         if el:
-                            # Human-like: move mouse first
                             bbox = await el.bounding_box()
                             if bbox:
                                 await page.mouse.move(
-                                    bbox["x"] + bbox["width"]/2 + random.uniform(-3, 3),
-                                    bbox["y"] + bbox["height"]/2 + random.uniform(-3, 3)
+                                    bbox["x"] + bbox["width"] / 2 + random.uniform(-3, 3),
+                                    bbox["y"] + bbox["height"] / 2 + random.uniform(-3, 3),
                                 )
-                                await asyncio.sleep(random.uniform(0.05, 0.18))
+                                await asyncio.sleep(random.uniform(0.05, 0.15))
                             await el.click()
-                            await asyncio.sleep(random.uniform(0.4, 1.0))
+                            await asyncio.sleep(random.uniform(0.4, 1.1))
                     except Exception as e:
                         log(task_id, f"Click error ({selector[:40]}): {str(e)[:80]}", "warning", supabase)
-                        # Try JS click as fallback
-                        try:
-                            await page.evaluate(f'document.querySelector("{selector}")?.click()')
-                        except Exception:
-                            pass
+                        try: await page.evaluate(f'document.querySelector("{selector}")?.click()')
+                        except: pass
 
             elif action_type == "TYPE":
                 selector = action.get("selector", "")
                 text     = action.get("text", "")
-                if selector and text:
+                if selector and text is not None:
                     try:
                         el = await page.wait_for_selector(selector, timeout=8000, state="visible")
                         if el:
-                            await el.click()
-                            await asyncio.sleep(0.15)
-                            await el.triple_click()
-                            await asyncio.sleep(0.1)
-                            # Human-like typing with natural speed variation
-                            for char in text:
-                                await page.keyboard.type(char, delay=random.randint(50, 150))
-                                if random.random() < 0.05:  # occasional pause
+                            await el.click(); await asyncio.sleep(0.1)
+                            await el.triple_click(); await asyncio.sleep(0.1)
+                            for char in str(text):
+                                await page.keyboard.type(char, delay=random.randint(50, 140))
+                                if random.random() < 0.04:
                                     await asyncio.sleep(random.uniform(0.2, 0.5))
-                            log(task_id, f'⌨️ Typed "{text[:40]}" into {selector[:40]}', "info", supabase)
+                            log(task_id, f'⌨️ Typed "{str(text)[:40]}" → {selector[:40]}', "info", supabase)
                     except Exception as e:
                         log(task_id, f"Type error: {str(e)[:80]}", "warning", supabase)
 
             elif action_type == "PRESS_KEY":
                 key = action.get("key", "Enter")
-                await asyncio.sleep(random.uniform(0.1, 0.3))
+                await asyncio.sleep(random.uniform(0.1, 0.25))
                 await page.keyboard.press(key)
-                await asyncio.sleep(random.uniform(0.5, 1.5))
+                await asyncio.sleep(random.uniform(0.5, 1.4))
                 log(task_id, f"⌨️ Pressed {key}", "info", supabase)
 
             elif action_type == "SCROLL":
                 scroll_y = action.get("scrollY", 400)
                 scroll_x = action.get("scrollX", 0)
-                # Human-like scroll in chunks
                 chunks = max(1, abs(scroll_y) // 120)
-                chunk_size = scroll_y / chunks
                 for _ in range(chunks):
-                    await page.mouse.wheel(scroll_x, chunk_size)
-                    await asyncio.sleep(random.uniform(0.06, 0.14))
+                    await page.mouse.wheel(scroll_x, scroll_y / chunks)
+                    await asyncio.sleep(random.uniform(0.06, 0.13))
                 await asyncio.sleep(random.uniform(0.3, 0.7))
 
             elif action_type == "EXTRACT":
-                js_expr = action.get("js", "")
+                js_expr = action.get("js") or "document.body.innerText.slice(0,1000)"
                 label   = action.get("label", "data")
-                if not js_expr:
-                    # Model forgot to include js field — use a sensible default
-                    js_expr = "document.body.innerText.slice(0, 1000)"
-                    label   = "page-content"
-                    log(task_id, "⚠️ EXTRACT missing js field — using page text fallback", "warning", supabase)
                 try:
                     extracted = await page.evaluate(js_expr)
                     if extracted is None:
-                        # Try page text fallback
                         extracted = await page.evaluate("document.body.innerText.slice(0,500)")
-                    extracted_str = str(extracted)[:600] if extracted else "(empty — page may need more time to load)"
+                    extracted_str = str(extracted)[:600]
                     memory.append(f"{label}: {extracted_str}")
                     log(task_id, f"📊 Extracted [{label}]: {extracted_str[:250]}", "success", supabase)
-                    # Track completion so model knows to advance
-                    if label not in completed_extracts:
-                        completed_extracts.append(label)
+                    if label not in completed_extracts: completed_extracts.append(label)
                     last_extract_url = page.url
-                    cur = page.url.rstrip('/')
-                    if cur not in extracted_urls:
-                        extracted_urls.append(cur)
-                    # Reset consecutive waits on successful extract
+                    if page.url.rstrip('/') not in extracted_urls: extracted_urls.append(page.url.rstrip('/'))
                     consecutive_waits = 0
-                    # Reset recent_actions so loop detector doesn't fire prematurely
                     recent_actions.clear()
                 except Exception as e:
-                    log(task_id, f"Extract error ({js_expr[:60]}): {str(e)[:80]}", "warning", supabase)
-                    # Fallback: get visible text
+                    log(task_id, f"Extract error: {str(e)[:80]}", "warning", supabase)
                     try:
                         fallback = await page.evaluate("document.body.innerText.slice(0,300)")
                         memory.append(f"{label}-fallback: {fallback}")
-                        log(task_id, f"📊 Extracted [{label}-fallback via body text]: {str(fallback)[:150]}", "success", supabase)
-                    except Exception:
-                        pass
+                        log(task_id, f"📊 Fallback extract [{label}]: {str(fallback)[:150]}", "success", supabase)
+                    except: pass
 
             elif action_type == "WAIT":
                 ms = min(action.get("ms", 2000), 8000)
                 await asyncio.sleep(ms / 1000)
 
-            # Natural inter-step delay
-            await asyncio.sleep(random.uniform(0.4, 1.1))
+            elif action_type == "HOVER":
+                selector = action.get("selector", "")
+                if selector:
+                    try:
+                        await page.hover(selector, timeout=5000)
+                        await asyncio.sleep(random.uniform(0.3, 0.7))
+                    except: pass
 
-        # ── Wrap up ───────────────────────────────────────────────────────────
+            # Inter-step delay
+            await asyncio.sleep(random.uniform(0.4, 1.0))
+
+        # ── Final ──────────────────────────────────────────────────────────────
         if not final_summary:
-            final_summary = f"Completed {steps_done} steps. Memory: {' | '.join(memory[-3:])}"
+            final_summary = f"Completed {steps_done} steps."
             log(task_id, f"🏁 Agent finished {steps_done} steps", "success", supabase)
-            await upload_screenshot(page, task_id, steps_done, "Final state", supabase)
+            await capture_screenshot(page, task_id, steps_done, "Final state", supabase)
 
-        # Compile result
         result_summary = final_summary
         if memory:
             result_summary += "\n\nEXTRACTED DATA:\n" + "\n".join(f"• {m}" for m in memory)
 
         await browser.close()
-        return {
-            "success": True,
-            "summary": result_summary[:2000],
-            "steps":   steps_done,
-            "memory":  memory,
-        }
+        return {"success": True, "summary": result_summary[:2000], "steps": steps_done, "memory": memory}
 
 
-# ── Task Runner ───────────────────────────────────────────────────────────────
+# ── Task Runner ────────────────────────────────────────────────────────────────
 async def run_task(task_id: str):
     supabase = None
     if SUPABASE_AVAILABLE and SUPABASE_URL and SUPABASE_SVC_KEY:
@@ -739,43 +689,61 @@ async def run_task(task_id: str):
         print(f"[ERROR] Task {task_id} not found", flush=True)
         return
 
-    prompt = task.get("prompt", "")
-    name   = task.get("name", "Unknown")
+    prompt  = task.get("prompt", "")
     user_id = task.get("user_id", "")
 
-    # Load Cerebras keys (settings table + env)
-    pool = None
-    all_keys = []
+    # Load user settings (Cerebras + Cloudflare)
+    cerebras_keys: List[str] = []
+    cf_account_id = CF_ACCOUNT_ID_ENV
+    cf_keys:       List[str] = [k.strip() for k in CF_API_KEY_ENV.split(",") if k.strip()]
+    cf_model       = CF_MODEL_ENV or "@cf/moonshotai/kimi-k2.6"
+    nopecha_key    = NOPECHA_KEY
+
     if supabase and user_id:
         try:
-            sr = supabase.table("settings").select("cerebras_keys").eq("user_id", user_id).execute()
+            sr = supabase.table("settings").select(
+                "cerebras_keys,cloudflare_account_id,cloudflare_keys,cloudflare_model,nopecha_key"
+            ).eq("user_id", user_id).execute()
             for row in (sr.data or []):
-                all_keys.extend(row.get("cerebras_keys") or [])
+                cerebras_keys.extend(row.get("cerebras_keys") or [])
+                if row.get("cloudflare_account_id"):
+                    cf_account_id = row["cloudflare_account_id"]
+                if row.get("cloudflare_keys"):
+                    cf_keys = row["cloudflare_keys"]
+                if row.get("cloudflare_model"):
+                    cf_model = row["cloudflare_model"]
+                if row.get("nopecha_key"):
+                    nopecha_key = row["nopecha_key"]
         except Exception as e:
-            print(f"[WARN] Settings load: {e}", flush=True)
+            print(f"[WARN] Settings: {e}", flush=True)
 
-    env_keys = [k.strip() for k in os.environ.get("CEREBRAS_API_KEYS", "").split(",") if k.strip()]
-    all_keys.extend(env_keys)
-    all_keys = list(dict.fromkeys(all_keys))  # deduplicate
+    # Env-override Cerebras keys
+    env_cerebras = [k.strip() for k in os.environ.get("CEREBRAS_API_KEYS", "").split(",") if k.strip()]
+    cerebras_keys.extend(env_cerebras)
+    cerebras_keys = list(dict.fromkeys(cerebras_keys))
 
-    if all_keys:
-        pool = CerebrasPool(all_keys)
-        print(f"[Cerebras] Pool ready: {pool.size} key(s)", flush=True)
+    cerebras_pool = CerebrasPool(cerebras_keys) if cerebras_keys else None
+    cf_pool       = CloudflarePool(cf_account_id, cf_keys, cf_model) if (cf_account_id and cf_keys) else None
+
+    if cerebras_pool:
+        print(f"[Cerebras] Pool ready: {cerebras_pool.size} key(s)", flush=True)
+    if cf_pool and cf_pool.ready:
+        print(f"[Cloudflare] Pool ready: {cf_pool.size} key(s), model: {cf_pool.model}", flush=True)
+    if not cerebras_pool and (not cf_pool or not cf_pool.ready):
+        print("[WARN] No AI providers configured — agent will use WAIT fallback", flush=True)
 
     # Mark running
     if supabase:
         supabase.table("tasks").update({
             "status":   "running",
             "last_run": datetime.utcnow().isoformat(),
-            "error":    None,
         }).eq("id", task_id).execute()
 
-    log(task_id, f"🤖 AutoAgent Pro starting — Task: {name}", "info", supabase)
+    log(task_id, "🤖 AutoAgent Pro starting…", "info", supabase)
 
-    # Run
     result = {"success": False, "summary": "", "steps": 0}
     try:
-        result = await run_agent(task_id, prompt, pool, supabase)
+        result = await run_agent(task_id, prompt, cerebras_pool, cf_pool, supabase, nopecha_key)
     except Exception as e:
         log(task_id, f"❌ Agent crashed: {e}", "error", supabase)
         traceback.print_exc()
@@ -784,24 +752,24 @@ async def run_task(task_id: str):
     # Save result
     if supabase:
         supabase.table("tasks").update({
-            "status": "completed" if result["success"] else "failed",
-            "result": {
+            "status":     "completed" if result["success"] else "failed",
+            "result":     json.dumps({
                 "success":     result["success"],
                 "summary":     result.get("summary", "")[:2000],
                 "stepCount":   result.get("steps", 0),
                 "completedAt": datetime.utcnow().isoformat(),
-            },
+            }),
             "updated_at": datetime.utcnow().isoformat(),
         }).eq("id", task_id).execute()
 
     status = "✅ SUCCESS" if result["success"] else "❌ FAILED"
-    log(task_id, f"{status} — {result.get('steps', 0)} steps | {result.get('summary','')[:150]}",
+    log(task_id, f"{status} — {result.get('steps', 0)} steps | {result.get('summary', '')[:150]}",
         "success" if result["success"] else "error", supabase)
 
 
 if __name__ == "__main__":
     tid = sys.argv[1] if len(sys.argv) > 1 else os.environ.get("TASK_ID", "")
     if not tid:
-        print("Usage: python browser_use_worker.py <task_id>", flush=True)
+        print("Usage: python scripts/browser_use_worker.py <task_id>", flush=True)
         sys.exit(1)
     asyncio.run(run_task(tid))

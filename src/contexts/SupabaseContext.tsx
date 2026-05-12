@@ -1,6 +1,9 @@
 import React, { createContext, useContext, useEffect, useState } from "react";
 import { createClient, SupabaseClient, User } from "@supabase/supabase-js";
 
+const DEFAULT_SUPABASE_URL = "https://beglgkjaejuvhqhddqfh.supabase.co";
+const DEFAULT_SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImJlZ2xna2phZWp1dmhxaGRkcWZoIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzg1Nzc4MjcsImV4cCI6MjA5NDE1MzgyN30.lMYsJ6LdQlWDF4GvzimoXkJqhR8vg7A5zdNgtpLAm3Y";
+
 interface SupabaseContextType {
   supabase: SupabaseClient | null;
   user: User | null;
@@ -25,20 +28,11 @@ export const SupabaseProvider = ({ children }: { children: React.ReactNode }) =>
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
-    const url = import.meta.env.VITE_SUPABASE_URL || "";
-    const key = import.meta.env.VITE_SUPABASE_ANON_KEY || "";
-
-    if (!url || !key) {
-      console.warn("Supabase credentials not configured");
-      setLoading(false);
-      return;
-    }
+    const url = import.meta.env.VITE_SUPABASE_URL || DEFAULT_SUPABASE_URL;
+    const key = import.meta.env.VITE_SUPABASE_ANON_KEY || DEFAULT_SUPABASE_ANON_KEY;
 
     const client = createClient(url, key, {
-      auth: {
-        persistSession: true,
-        autoRefreshToken: true,
-      },
+      auth: { persistSession: true, autoRefreshToken: true },
     });
     setSupabase(client);
 

@@ -13,7 +13,7 @@ on:
 jobs:
   run-agent:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 25
 
     steps:
       - name: Checkout
@@ -68,7 +68,9 @@ jobs:
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
           CEREBRAS_API_KEYS:         ${{ secrets.CEREBRAS_API_KEYS }}
           NOPECHA_API_KEY:           ${{ secrets.NOPECHA_API_KEY }}
-          GEMINI_API_KEY:            ${{ secrets.GEMINI_API_KEY }}
+          CLOUDFLARE_ACCOUNT_ID:     ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_API_KEY:        ${{ secrets.CLOUDFLARE_API_KEY }}
+          CLOUDFLARE_MODEL:          ${{ secrets.CLOUDFLARE_MODEL }}
           TASK_ID:                   ${{ github.event.inputs.task_id }}
         run: |
           if [ -n "$TASK_ID" ]; then

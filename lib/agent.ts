@@ -1,16 +1,16 @@
 /**
  * AutoAgent Pro — Autonomous Browser Agent
- * Primary AI: Cerebras gpt-oss-120b (ultra-fast inference)
- * Fallback: Google Gemini 2.0 Flash (vision)
- * Browser: Playwright with stealth & human-like behavior
+ * Primary AI:  Cerebras gpt-oss-120b (ultra-fast text reasoning)
+ * Vision AI:   Cloudflare Workers AI kimi-k2.6 (screenshot analysis)
+ * Browser:     Playwright with stealth & human-like behaviour
  */
 import playwright, { Page, BrowserContext } from "playwright";
-import { GoogleGenAI } from "@google/genai";
 import { CerebrasClient, createCerebrasClient } from "./cerebras.js";
 import { sleep, randomBetween, humanDelay } from "./utils.js";
 
 interface AgentAction {
-  action: "CLICK" | "TYPE" | "SCROLL" | "WAIT" | "FINISH" | "GOTO" | "HOVER" | "PRESS_KEY" | "SCREENSHOT" | "SELECT" | "CLEAR";
+  action: "CLICK" | "TYPE" | "SCROLL" | "WAIT" | "FINISH" | "GOTO" | "HOVER" |
+          "PRESS_KEY" | "SCREENSHOT" | "SELECT" | "CLEAR" | "EXTRACT";
   selector?: string;
   text?: string;
   url?: string;
@@ -18,6 +18,8 @@ interface AgentAction {
   value?: string;
   scrollX?: number;
   scrollY?: number;
+  js?: string;
+  label?: string;
   reason: string;
 }
 
@@ -25,7 +27,9 @@ export interface AgentOptions {
   taskId: string;
   prompt: string;
   cerebrasKeys?: string[];
-  geminiApiKey?: string;
+  cloudflareAccountId?: string;
+  cloudflareKeys?: string[];
+  cloudflareModel?: string;
   nopechaKey?: string;
   onLog?: (message: string, type?: "info" | "success" | "error" | "warning") => void;
   onScreenshot?: (base64: string) => void;
@@ -33,46 +37,51 @@ export interface AgentOptions {
   supabase?: any;
 }
 
-const AGENT_SYSTEM_PROMPT = `You are AutoAgent Pro, an autonomous browser agent using Cerebras gpt-oss-120b.
-Your job is to analyze web page screenshots and decide the next browser action to complete the user's task.
+const AGENT_SYSTEM_PROMPT = `You are AutoAgent Pro, an autonomous browser agent.
+Analyse the current page context and return the next browser action as JSON.
 
 Rules:
-- Always return valid JSON with the exact schema provided
-- Use precise CSS selectors: prefer [name="..."], [type="..."], [placeholder="..."], button:has-text("...")
+- Always return valid JSON with the exact schema — no markdown, no explanation
+- Use precise CSS selectors: prefer [name="..."], [type="..."], [placeholder="..."]
 - For forms: TYPE into inputs, then PRESS_KEY Enter or CLICK submit
-- If a CAPTCHA is detected, use WAIT action with reason "captcha_detected"
-- If the task is complete, use FINISH with a detailed summary in the reason field
-- Be methodical: don't skip steps, verify each action succeeded before moving on`;
+- CAPTCHA detected → WAIT with reason "captcha_detected"
+- Task complete → FINISH with detailed summary
+- Be methodical: verify each action succeeded before moving on`;
 
 export class AutonomousAgent {
   private page!: Page;
   private context!: BrowserContext;
   private browser!: playwright.Browser;
   private cerebras?: CerebrasClient;
-  private genAI?: GoogleGenAI;
+  private cfKeys: string[] = [];
+  private cfKeyIndex = 0;
+  private cfAccountId = "";
+  private cfModel = "@cf/moonshotai/kimi-k2.6";
   private logs: string[] = [];
   private options: AgentOptions;
   private stepCount = 0;
   private maxSteps: number;
   private pageHistory: string[] = [];
+  private memory: string[] = [];
 
   constructor(options: AgentOptions) {
     this.options = options;
     this.maxSteps = options.maxSteps || 30;
 
-    // Initialize Cerebras (primary)
-    if (options.cerebrasKeys && options.cerebrasKeys.length > 0) {
+    if (options.cerebrasKeys?.length) {
       this.cerebras = createCerebrasClient(options.cerebrasKeys);
-      this.log(`Cerebras initialized with ${this.cerebras.keyCount} key(s), model: gpt-oss-120b`, "info");
+      this.log(`Cerebras ready — ${this.cerebras.keyCount} key(s)`, "info");
     }
 
-    // Initialize Gemini (vision fallback)
-    if (options.geminiApiKey) {
-      this.genAI = new GoogleGenAI({ apiKey: options.geminiApiKey });
+    if (options.cloudflareAccountId && options.cloudflareKeys?.length) {
+      this.cfAccountId = options.cloudflareAccountId;
+      this.cfKeys = options.cloudflareKeys.filter(k => k?.trim());
+      this.cfModel = options.cloudflareModel || "@cf/moonshotai/kimi-k2.6";
+      this.log(`Cloudflare AI ready — ${this.cfKeys.length} key(s), model: ${this.cfModel}`, "info");
     }
 
-    if (!this.cerebras && !this.genAI) {
-      throw new Error("At least one AI provider (Cerebras or Gemini) must be configured");
+    if (!this.cerebras && !this.cfKeys.length) {
+      throw new Error("At least one AI provider must be configured (Cerebras or Cloudflare)");
     }
   }
 
@@ -80,38 +89,36 @@ export class AutonomousAgent {
     const entry = `[${new Date().toISOString()}] [${type.toUpperCase()}] ${message}`;
     this.logs.push(entry);
     this.options.onLog?.(message, type);
-    console.log(entry);
+  }
+
+  private nextCfKey(): string | null {
+    if (!this.cfKeys.length) return null;
+    const key = this.cfKeys[this.cfKeyIndex % this.cfKeys.length];
+    this.cfKeyIndex = (this.cfKeyIndex + 1) % this.cfKeys.length;
+    return key;
   }
 
   async initialize(): Promise<void> {
-    this.log("Launching stealth browser (Playwright + anti-detection)...", "info");
+    this.log("Launching stealth browser (Playwright + anti-detection)…", "info");
 
     this.browser = await playwright.chromium.launch({
       headless: true,
       args: [
-        "--no-sandbox",
-        "--disable-setuid-sandbox",
+        "--no-sandbox", "--disable-setuid-sandbox",
         "--disable-blink-features=AutomationControlled",
         "--disable-features=IsolateOrigins,site-per-process",
-        "--disable-infobars",
-        "--window-size=1366,768",
-        "--disable-dev-shm-usage",
-        "--disable-gpu",
-        "--no-first-run",
-        "--no-zygote",
+        "--disable-infobars", "--window-size=1366,768",
+        "--disable-dev-shm-usage", "--disable-gpu",
+        "--no-first-run", "--no-zygote",
       ],
     });
 
-    const viewportWidth = randomBetween(1280, 1440);
-    const viewportHeight = randomBetween(700, 800);
+    const w = randomBetween(1280, 1440);
+    const h = randomBetween(700, 800);
 
     this.context = await this.browser.newContext({
-      viewport: { width: viewportWidth, height: viewportHeight },
-      userAgent: [
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
-        "AppleWebKit/537.36 (KHTML, like Gecko)",
-        "Chrome/124.0.0.0 Safari/537.36"
-      ].join(" "),
+      viewport: { width: w, height: h },
+      userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
       locale: "en-US",
       timezoneId: "America/New_York",
       permissions: ["geolocation"],
@@ -123,56 +130,42 @@ export class AutonomousAgent {
       },
     });
 
-    // Stealth injection
     await this.context.addInitScript(() => {
       Object.defineProperty(navigator, "webdriver", { get: () => false });
       Object.defineProperty(navigator, "plugins", { get: () => [1, 2, 3, 4, 5] });
       Object.defineProperty(navigator, "languages", { get: () => ["en-US", "en"] });
       Object.defineProperty(navigator, "hardwareConcurrency", { get: () => 8 });
       Object.defineProperty(navigator, "deviceMemory", { get: () => 8 });
-
+      (window as any).chrome = { runtime: {} };
       const origQuery = window.navigator.permissions.query;
       window.navigator.permissions.query = (p: any) =>
         p.name === "notifications"
           ? Promise.resolve({ state: "denied" } as PermissionStatus)
           : origQuery(p);
-
-      // Mask chrome automation
-      (window as any).chrome = { runtime: {} };
     });
 
     this.page = await this.context.newPage();
-
-    // Random human-like page load behavior
-    this.page.on("load", async () => {
-      await sleep(randomBetween(300, 800));
-    });
-
-    this.log(`Browser ready (${viewportWidth}x${viewportHeight}, stealth enabled)`, "success");
+    this.page.on("load", async () => { await sleep(randomBetween(200, 600)); });
+    this.log(`Browser ready (${w}x${h}, stealth enabled)`, "success");
   }
 
   private async humanClick(selector: string): Promise<void> {
     try {
-      const element = await this.page.waitForSelector(selector, { timeout: 8000, state: "visible" });
-      if (!element) throw new Error(`Element not found: ${selector}`);
-
-      const box = await element.boundingBox();
-      if (!box) throw new Error(`Cannot get bounding box for: ${selector}`);
-
-      // Natural mouse trajectory to element
-      const targetX = box.x + box.width / 2 + randomBetween(-4, 4);
-      const targetY = box.y + box.height / 2 + randomBetween(-3, 3);
-
-      await this.page.mouse.move(targetX - randomBetween(50, 150), targetY - randomBetween(20, 60), { steps: 5 });
+      const el = await this.page.waitForSelector(selector, { timeout: 8000, state: "visible" });
+      if (!el) throw new Error(`Not found: ${selector}`);
+      const box = await el.boundingBox();
+      if (!box) throw new Error(`No bounding box: ${selector}`);
+      const tx = box.x + box.width / 2 + randomBetween(-4, 4);
+      const ty = box.y + box.height / 2 + randomBetween(-3, 3);
+      await this.page.mouse.move(tx - randomBetween(50, 150), ty - randomBetween(20, 60), { steps: 5 });
       await humanDelay(80, 200);
-      await this.page.mouse.move(targetX, targetY, { steps: randomBetween(10, 25) });
+      await this.page.mouse.move(tx, ty, { steps: randomBetween(10, 25) });
       await humanDelay(40, 100);
       await this.page.mouse.down();
       await humanDelay(40, 100);
       await this.page.mouse.up();
     } catch {
-      // Fallback to direct click
-      await this.page.click(selector, { timeout: 5000 });
+      await this.page.click(selector, { timeout: 5000 }).catch(() => {});
     }
   }
 
@@ -181,14 +174,13 @@ export class AutonomousAgent {
     await humanDelay(100, 250);
     await this.page.keyboard.press("Control+a");
     await humanDelay(50, 100);
-
     for (const char of text) {
       await this.page.keyboard.type(char, { delay: randomBetween(45, 130) });
-      if (Math.random() < 0.03) await sleep(randomBetween(400, 800)); // Random thinking pause
+      if (Math.random() < 0.03) await sleep(randomBetween(400, 800));
     }
   }
 
-  private async humanScroll(x: number = 0, y: number = 300): Promise<void> {
+  private async humanScroll(x = 0, y = 300): Promise<void> {
     const steps = randomBetween(4, 9);
     for (let i = 0; i < steps; i++) {
       await this.page.mouse.wheel(x / steps, y / steps);
@@ -201,256 +193,242 @@ export class AutonomousAgent {
     return buf.toString("base64");
   }
 
-  private async decideWithCerebras(pageContext: string, objective: string): Promise<AgentAction> {
-    const messages = [{
-      role: "user" as const,
-      content: `OBJECTIVE: ${objective}
-
-CURRENT STATE:
-${pageContext}
-
-Return a JSON action object:
-{
-  "action": "CLICK|TYPE|SCROLL|WAIT|FINISH|GOTO|HOVER|PRESS_KEY|SELECT|CLEAR",
-  "selector": "CSS selector",
-  "text": "text to type",
-  "url": "URL for GOTO",
-  "key": "key for PRESS_KEY",
-  "scrollX": 0,
-  "scrollY": 400,
-  "value": "value for SELECT",
-  "reason": "clear explanation of why"
-}
-
-Return FINISH when the objective is complete. Only return JSON, no markdown.`,
-    }];
-
-    const response = await this.cerebras!.chatJSON<AgentAction>(messages, {
-      systemPrompt: AGENT_SYSTEM_PROMPT,
-      temperature: 0.2,
-      maxTokens: 512,
-    });
-
-    return response;
-  }
-
-  private async decideWithGemini(screenshot: string, objective: string): Promise<AgentAction> {
-    const pageUrl = this.page.url();
-    const response = await this.genAI!.models.generateContent({
-      model: "gemini-2.0-flash",
-      contents: [{
-        role: "user",
-        parts: [
-          { inlineData: { mimeType: "image/jpeg", data: screenshot } },
-          {
-            text: `OBJECTIVE: ${objective}
-URL: ${pageUrl}
-Step: ${this.stepCount}
-
-Return JSON action:
-{"action":"CLICK|TYPE|SCROLL|WAIT|FINISH|GOTO","selector":"CSS","text":"","url":"","key":"","scrollX":0,"scrollY":300,"reason":"why"}`
-          },
-        ],
-      }],
-      generationConfig: { responseMimeType: "application/json", maxOutputTokens: 512 },
-    });
-
-    const text = response.candidates?.[0]?.content?.parts?.[0]?.text || "{}";
-    try {
-      return JSON.parse(text);
-    } catch {
-      return { action: "WAIT", reason: "JSON parse error from Gemini" };
-    }
-  }
-
   private async getPageContext(): Promise<string> {
     const url = this.page.url();
     const title = await this.page.title().catch(() => "Unknown");
-
-    // Extract key interactive elements for Cerebras (text-based reasoning)
     const elements = await this.page.evaluate(() => {
-      const getElements = (sel: string) =>
-        Array.from(document.querySelectorAll(sel))
-          .slice(0, 12)
-          .map(el => ({
-            tag: el.tagName.toLowerCase(),
-            type: (el as any).type || "",
-            name: (el as any).name || "",
-            id: el.id || "",
-            placeholder: (el as any).placeholder || "",
-            text: el.textContent?.trim().slice(0, 60) || "",
-            class: el.className?.toString().split(" ").slice(0, 3).join(" ") || "",
-          }));
-
+      const get = (sel: string) => Array.from(document.querySelectorAll(sel)).slice(0, 12).map(el => ({
+        tag: el.tagName.toLowerCase(),
+        type: (el as any).type || "",
+        name: (el as any).name || "",
+        id: el.id || "",
+        placeholder: (el as any).placeholder || "",
+        text: el.textContent?.trim().slice(0, 60) || "",
+      }));
       return {
-        inputs: getElements("input:not([type=hidden]),textarea,select"),
-        buttons: getElements("button,a,input[type=submit],input[type=button]"),
+        inputs: get("input:not([type=hidden]),textarea,select"),
+        buttons: get("button,a,input[type=submit],input[type=button],[role=button]"),
         headings: Array.from(document.querySelectorAll("h1,h2,h3")).slice(0, 5).map(h => h.textContent?.trim()),
-        hasRecaptcha: !!document.querySelector(".g-recaptcha,[data-sitekey]"),
-        hasHcaptcha: !!document.querySelector(".h-captcha"),
-        formCount: document.querySelectorAll("form").length,
-        errorMessages: Array.from(document.querySelectorAll('[class*="error"],[class*="alert"],[role="alert"]')).slice(0, 3).map(e => e.textContent?.trim()),
+        bodyText: document.body.innerText.slice(0, 2000),
+        hasCaptcha: !!(document.querySelector(".g-recaptcha,[data-sitekey],.h-captcha")),
+        errors: Array.from(document.querySelectorAll('[class*="error"],[role="alert"]')).slice(0, 3).map(e => e.textContent?.trim()),
+        links: Array.from(document.querySelectorAll("a[href]")).slice(0, 8).map(a => ({ text: a.textContent?.trim().slice(0, 50), href: (a as HTMLAnchorElement).href })),
       };
-    });
+    }).catch(() => ({ inputs: [], buttons: [], headings: [], bodyText: "", hasCaptcha: false, errors: [], links: [] }));
+
+    const memStr = this.memory.length > 0 ? `\nEXTRACTED: ${this.memory.slice(-4).join(" | ")}` : "";
 
     return `URL: ${url}
-Title: ${title}
-Step: ${this.stepCount}/${this.maxSteps}
-CAPTCHA detected: ${elements.hasRecaptcha || elements.hasHcaptcha}
+TITLE: ${title}
+STEP: ${this.stepCount}/${this.maxSteps}
+CAPTCHA: ${elements.hasCaptcha}
+HEADINGS: ${elements.headings?.join(" | ") || "none"}
+PAGE TEXT:\n${elements.bodyText.slice(0, 1500)}
+INPUTS: ${JSON.stringify(elements.inputs.slice(0, 6))}
+BUTTONS: ${JSON.stringify(elements.buttons?.slice(0, 8))}
+LINKS: ${JSON.stringify(elements.links.slice(0, 6))}
+ERRORS: ${elements.errors?.join(" | ") || "none"}
+PREV PAGES: ${this.pageHistory.slice(-3).join(" → ")}${memStr}`;
+  }
 
-PAGE ELEMENTS:
-Headings: ${elements.headings?.join(" | ") || "none"}
-Inputs: ${JSON.stringify(elements.inputs)}
-Buttons: ${JSON.stringify(elements.buttons?.slice(0, 8))}
-Forms: ${elements.formCount}
-Errors: ${elements.errorMessages?.join(" | ") || "none"}
-Previous pages: ${this.pageHistory.slice(-3).join(" → ")}`;
+  private async decideWithCerebras(pageContext: string): Promise<AgentAction> {
+    const messages = [{
+      role: "user" as const,
+      content: `OBJECTIVE: ${this.options.prompt}\n\nCURRENT STATE:\n${pageContext}\n\nReturn ONE JSON action object. Actions: CLICK, TYPE, SCROLL, WAIT, FINISH, GOTO, HOVER, PRESS_KEY, SELECT, CLEAR, EXTRACT\nRequired fields depend on action. Always include "reason". Return raw JSON only.`,
+    }];
+    return this.cerebras!.chatJSON<AgentAction>(messages, { systemPrompt: AGENT_SYSTEM_PROMPT, temperature: 0.2, maxTokens: 512 });
+  }
+
+  private async decideWithCloudflare(screenshot: string): Promise<AgentAction> {
+    const key = this.nextCfKey();
+    if (!key) throw new Error("No Cloudflare keys available");
+
+    const pageUrl = this.page.url();
+    const res = await fetch(
+      `https://api.cloudflare.com/client/v4/accounts/${this.cfAccountId}/ai/run/${this.cfModel}`,
+      {
+        method: "POST",
+        headers: { Authorization: `Bearer ${key}`, "Content-Type": "application/json" },
+        body: JSON.stringify({
+          messages: [{
+            role: "user",
+            content: [
+              { type: "image_url", image_url: { url: `data:image/jpeg;base64,${screenshot}` } },
+              {
+                type: "text",
+                text: `OBJECTIVE: ${this.options.prompt}\nURL: ${pageUrl}\nStep: ${this.stepCount}\n\nReturn ONE JSON action: {"action":"CLICK|TYPE|SCROLL|WAIT|FINISH|GOTO","selector":"CSS","text":"","url":"","key":"","scrollX":0,"scrollY":300,"reason":"why"}\nRaw JSON only.`,
+              },
+            ],
+          }],
+        }),
+      }
+    );
+
+    if (res.status === 429) throw new Error("Cloudflare rate limited");
+    if (!res.ok) throw new Error(`Cloudflare API error ${res.status}`);
+
+    const data = await res.json();
+    const text = data?.result?.response || "{}";
+    try {
+      const m = text.match(/```json\s*([\s\S]*?)\s*```/) || text.match(/\{[\s\S]*\}/);
+      return JSON.parse(m ? (m[1] || m[0]) : text);
+    } catch {
+      return { action: "WAIT", reason: "Cloudflare JSON parse error" };
+    }
   }
 
   private async executeAction(action: AgentAction): Promise<boolean> {
     this.log(`[${action.action}] ${action.reason}`, "info");
-
     try {
       switch (action.action) {
-        case "GOTO":
+        case "GOTO": {
           const url = action.url || "";
           if (!url) throw new Error("No URL for GOTO");
           await this.page.goto(url, { waitUntil: "domcontentloaded", timeout: 30000 });
           this.pageHistory.push(url);
           await sleep(randomBetween(600, 1500));
           break;
-
+        }
         case "CLICK":
           await this.humanClick(action.selector!);
           await sleep(randomBetween(300, 700));
           break;
-
         case "TYPE":
           await this.humanType(action.selector!, action.text || "");
           await sleep(randomBetween(200, 400));
           break;
-
         case "CLEAR":
           await this.page.fill(action.selector!, "");
           break;
-
         case "SELECT":
           await this.page.selectOption(action.selector!, action.value || action.text || "");
           await sleep(200);
           break;
-
         case "SCROLL":
           await this.humanScroll(action.scrollX || 0, action.scrollY || 300);
           await sleep(randomBetween(200, 400));
           break;
-
         case "HOVER":
           await this.page.hover(action.selector!, { timeout: 5000 });
           await sleep(randomBetween(300, 600));
           break;
-
         case "PRESS_KEY":
           await this.page.keyboard.press(action.key || "Enter");
           await sleep(randomBetween(300, 600));
           break;
-
-        case "SCREENSHOT":
+        case "SCREENSHOT": {
           const ss = await this.takeScreenshot();
           this.options.onScreenshot?.(ss);
           break;
-
-        case "WAIT":
-          const waitTime = action.reason?.includes("captcha") ? 8000 : randomBetween(1500, 3500);
-          this.log(`Waiting ${waitTime}ms (${action.reason})`, "info");
-          await sleep(waitTime);
+        }
+        case "EXTRACT": {
+          if (action.js) {
+            const result = await this.page.evaluate(action.js).catch(() => null);
+            const str = String(result || "").slice(0, 600);
+            this.memory.push(`${action.label || "data"}: ${str}`);
+            this.log(`📊 Extracted [${action.label}]: ${str.slice(0, 200)}`, "success");
+          }
           break;
-
+        }
+        case "WAIT": {
+          const ms = action.reason?.includes("captcha") ? 8000 : randomBetween(1500, 3500);
+          await sleep(ms);
+          break;
+        }
         case "FINISH":
           this.log(`Task complete: ${action.reason}`, "success");
-          return true; // Signal completion
+          if (this.memory.length) this.log(`Collected: ${this.memory.join(" | ")}`, "success");
+          return true;
       }
     } catch (err: any) {
       this.log(`Action failed: ${err.message}`, "warning");
-
-      // Try scroll into view then retry for visibility issues
       if (action.selector && (action.action === "CLICK" || action.action === "TYPE")) {
         try {
-          await this.page.evaluate((sel) => {
+          await this.page.evaluate(sel => {
             document.querySelector(sel)?.scrollIntoView({ behavior: "smooth", block: "center" });
           }, action.selector);
           await sleep(600);
-
           if (action.action === "CLICK") await this.page.click(action.selector, { timeout: 5000 });
-          else if (action.action === "TYPE") await this.page.fill(action.selector, action.text || "");
-
+          else await this.page.fill(action.selector, action.text || "");
           this.log(`Retry succeeded for ${action.selector}`, "info");
         } catch (retryErr: any) {
-          this.log(`Retry also failed: ${retryErr.message}`, "warning");
+          this.log(`Retry failed: ${retryErr.message}`, "warning");
         }
       }
     }
-
-    return false; // Not finished
+    return false;
   }
 
   async run(): Promise<{ success: boolean; logs: string[]; summary: string; steps: number }> {
     try {
       await this.initialize();
-      this.log(`Starting: ${this.options.prompt}`, "info");
+      this.log(`Starting task: ${this.options.prompt.slice(0, 100)}`, "info");
 
-      // Start with GOTO if prompt contains a URL
       const urlMatch = this.options.prompt.match(/https?:\/\/[^\s]+/);
       if (urlMatch) {
         await this.executeAction({ action: "GOTO", url: urlMatch[0], reason: "Navigate to target URL" });
       }
 
+      const recentActions: string[] = [];
+      let consecutiveWaits = 0;
+
       while (this.stepCount < this.maxSteps) {
         this.stepCount++;
-        this.log(`Step ${this.stepCount}/${this.maxSteps}`, "info");
+        this.log(`⚙️ Step ${this.stepCount}/${this.maxSteps}`, "info");
 
-        // Take screenshot for vision (always needed for Gemini fallback)
         const screenshot = await this.takeScreenshot();
         this.options.onScreenshot?.(screenshot);
 
-        // Decide next action: Cerebras (text) first, Gemini (vision) as fallback
+        // Loop detection
+        if (recentActions.length >= 4 && new Set(recentActions.slice(-4)).size === 1) {
+          this.log("⚠️ Loop detected — stopping", "warning");
+          break;
+        }
+        if (consecutiveWaits >= 5) {
+          this.log("⚠️ Too many WAITs — stopping", "warning");
+          break;
+        }
+
         let action: AgentAction;
         try {
           if (this.cerebras) {
-            const pageContext = await this.getPageContext();
-            action = await this.decideWithCerebras(pageContext, this.options.prompt);
-            this.log(`Cerebras decision (${this.cerebras.activeKeys}/${this.cerebras.keyCount} keys active): ${action.action}`, "info");
+            const ctx = await this.getPageContext();
+            action = await this.decideWithCerebras(ctx);
+            this.log(`🧠 Cerebras: ${action.action} — ${action.reason?.slice(0, 80)}`, "info");
           } else {
-            action = await this.decideWithGemini(screenshot, this.options.prompt);
-            this.log(`Gemini decision: ${action.action}`, "info");
+            action = await this.decideWithCloudflare(screenshot);
+            this.log(`☁️ Cloudflare: ${action.action} — ${action.reason?.slice(0, 80)}`, "info");
           }
         } catch (err: any) {
-          this.log(`AI error: ${err.message} — falling back...`, "warning");
-
-          // Try Gemini if Cerebras fails
-          if (this.genAI) {
-            try {
-              action = await this.decideWithGemini(screenshot, this.options.prompt);
-            } catch {
-              action = { action: "WAIT", reason: "Both AI providers failed, waiting..." };
+          this.log(`AI error: ${err.message} — trying Cloudflare vision…`, "warning");
+          try {
+            if (this.cfKeys.length > 0) {
+              action = await this.decideWithCloudflare(screenshot);
+            } else {
+              action = { action: "WAIT", reason: "AI error, waiting…" };
             }
-          } else {
-            action = { action: "WAIT", reason: "AI error, retrying..." };
+          } catch {
+            action = { action: "WAIT", reason: "All AI providers failed" };
           }
         }
 
-        // Execute and check if done
+        const actionKey = `${action.action}:${action.url || action.selector || ""}`.slice(0, 60);
+        recentActions.push(actionKey);
+        if (recentActions.length > 8) recentActions.shift();
+        consecutiveWaits = action.action === "WAIT" ? consecutiveWaits + 1 : 0;
+
         const done = await this.executeAction(action);
         if (done || action.action === "FINISH") break;
 
-        // Natural pace between steps
         await sleep(randomBetween(500, 1200));
       }
 
-      const summary = this.logs.slice(-3).join(" | ");
+      const summary = this.memory.length
+        ? `Collected data: ${this.memory.join(" | ")}`
+        : this.logs.slice(-3).join(" | ");
       return { success: true, logs: this.logs, summary, steps: this.stepCount };
-
     } catch (err: any) {
-      this.log(`Fatal error: ${err.message}`, "error");
+      this.log(`Fatal: ${err.message}`, "error");
       return { success: false, logs: this.logs, summary: `Error: ${err.message}`, steps: this.stepCount };
     } finally {
       await this.cleanup();
@@ -458,10 +436,7 @@ Previous pages: ${this.pageHistory.slice(-3).join(" → ")}`;
   }
 
   async cleanup(): Promise<void> {
-    try {
-      await this.browser?.close();
-      this.log("Browser closed cleanly", "info");
-    } catch { /* ignore */ }
+    try { await this.browser?.close(); } catch { /* ignore */ }
   }
 
   getLogs(): string[] { return this.logs; }
