@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 AutoAgent Pro - Browser Use Worker
-Primary AI: Cerebras gpt-oss-120b (ultra-fast inference)
+Primary AI: Cerebras gpt-oss-120b (auto-fallback to llama3.1-8b if unavailable)
 Fallback: Google Gemini 2.0 Flash
 Browser: Browser Use + Playwright (stealth mode)
 """
@@ -48,7 +48,8 @@ SUPABASE_SERVICE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 NOPECHA_API_KEY = os.environ.get("NOPECHA_API_KEY", "")
 TASK_ID = os.environ.get("TASK_ID", "")
-CEREBRAS_MODEL = "gpt-oss-120b"
+CEREBRAS_MODEL = "gpt-oss-120b"  # Primary model
+CEREBRAS_FALLBACK_MODELS = ["gpt-oss-120b", "llama3.1-8b", "llama3.1-70b"]  # Auto-fallback chain
 CEREBRAS_BASE = "https://api.cerebras.ai/v1"
 
 
@@ -80,7 +81,7 @@ class CerebrasKeyPool:
 
 
 async def cerebras_chat(pool: CerebrasKeyPool, messages: list, system: str = "", max_retries: int = 3) -> str:
-    """Call Cerebras gpt-oss-120b with automatic key rotation."""
+    """Call Cerebras with auto-fallback: gpt-oss-120b → llama3.1-8b → llama3.1-70b."""
     for attempt in range(max_retries):
         key = pool.next_key()
         if not key:
@@ -99,7 +100,7 @@ async def cerebras_chat(pool: CerebrasKeyPool, messages: list, system: str = "",
         try:
             async with httpx.AsyncClient(timeout=60) as client:
                 res = await client.post(f"{CEREBRAS_BASE}/chat/completions", headers=headers, json={
-                    "model": CEREBRAS_MODEL,
+                    "model": model,  # auto-selected from fallback chain
                     "messages": body_messages,
                     "temperature": 0.2,
                     "max_tokens": 1024,
