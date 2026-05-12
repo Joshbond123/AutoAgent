@@ -81,55 +81,70 @@ class CerebrasKeyPool:
 
 
 async def cerebras_chat(pool: CerebrasKeyPool, messages: list, system: str = "", max_retries: int = 3) -> str:
-    """Call Cerebras with auto-fallback: gpt-oss-120b → llama3.1-8b → llama3.1-70b."""
-    for attempt in range(max_retries):
-        key = pool.next_key()
-        if not key:
-            raise RuntimeError("No Cerebras API keys available")
+      """Call Cerebras with auto-fallback: gpt-oss-120b -> llama3.1-8b -> llama3.1-70b."""
+      fallback_models = ["gpt-oss-120b", "llama3.1-8b", "llama3.1-70b"]
 
-        headers = {
-            "Authorization": f"Bearer {key}",
-            "Content-Type": "application/json",
-        }
+      for model in fallback_models:
+          model_failed = False
+          for attempt in range(max_retries):
+              key = pool.next_key()
+              if not key:
+                  raise RuntimeError("No Cerebras API keys available")
 
-        body_messages = []
-        if system:
-            body_messages.append({"role": "system", "content": system})
-        body_messages.extend(messages)
+              req_headers = {
+                  "Authorization": f"Bearer {key}",
+                  "Content-Type": "application/json",
+              }
+              body_messages = []
+              if system:
+                  body_messages.append({"role": "system", "content": system})
+              body_messages.extend(messages)
 
-        try:
-            async with httpx.AsyncClient(timeout=60) as client:
-                res = await client.post(f"{CEREBRAS_BASE}/chat/completions", headers=headers, json={
-                    "model": model,  # auto-selected from fallback chain
-                    "messages": body_messages,
-                    "temperature": 0.2,
-                    "max_tokens": 1024,
-                })
+              try:
+                  async with httpx.AsyncClient(timeout=60) as client:
+                      res = await client.post(f"{CEREBRAS_BASE}/chat/completions", headers=req_headers, json={
+                          "model": model,
+                          "messages": body_messages,
+                          "temperature": 0.2,
+                          "max_tokens": 1024,
+                      })
 
-            if res.status_code in (401, 403):
-                pool.mark_failed(key)
-                continue
+                  if res.status_code in (401, 403):
+                      pool.mark_failed(key)
+                      model_failed = True
+                      break
 
-            if res.status_code == 429:
-                wait = (attempt + 1) * 2
-                print(f"[Cerebras] Rate limited, waiting {wait}s...", flush=True)
-                await asyncio.sleep(wait)
-                continue
+                  if res.status_code == 404:
+                      print(f"[Cerebras] Model {model} not available (404), trying fallback...", flush=True)
+                      model_failed = True
+                      break
 
-            res.raise_for_status()
-            data = res.json()
-            content = data["choices"][0]["message"]["content"]
-            print(f"[Cerebras] gpt-oss-120b responded ({len(content)} chars, key ...{key[-6:]})", flush=True)
-            return content
+                  if res.status_code == 429:
+                      wait = (attempt + 1) * 2
+                      print(f"[Cerebras] Rate limited on {model}, waiting {wait}s...", flush=True)
+                      await asyncio.sleep(wait)
+                      continue
 
-        except Exception as e:
-            print(f"[Cerebras] Attempt {attempt+1} failed: {e}", flush=True)
-            if attempt == max_retries - 1:
-                raise
+                  res.raise_for_status()
+                  data = res.json()
+                  reply = data["choices"][0]["message"]["content"]
+                  print(f"[Cerebras] {model} responded ({len(reply)} chars, key ...{key[-6:]})", flush=True)
+                  return reply
 
-    raise RuntimeError("Cerebras: all retries exhausted")
+              except Exception as e:
+                  err_str = str(e)
+                  if "404" in err_str or "not_found" in err_str.lower():
+                      print(f"[Cerebras] Model {model} unavailable, trying fallback...", flush=True)
+                      model_failed = True
+                      break
+                  print(f"[Cerebras] Attempt {attempt+1} failed: {e}", flush=True)
+                  if attempt == max_retries - 1:
+                      model_failed = True
 
+          if not model_failed:
+              pass  # success path returned already
 
+      raise RuntimeError("Cerebras: all models exhausted (gpt-oss-120b, llama3.1-8b, llama3.1-70b)")
 # ─── Logging ──────────────────────────────────────────────────────────────────
 def log(task_id: str, message: str, log_type: str = "info", supabase=None):
     prefix = {"info": "ℹ", "success": "✓", "error": "✗", "warning": "⚠"}.get(log_type, "ℹ")
