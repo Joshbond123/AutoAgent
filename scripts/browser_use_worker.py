@@ -282,12 +282,23 @@ def log_screenshot(task_id: str, b64: str, label: str, supabase=None):
 # ── Screenshot Capture ─────────────────────────────────────────────────────────
 async def capture_screenshot(page, task_id: str, step: int, label: str, supabase=None) -> Optional[str]:
     try:
-        buf = await page.screenshot(type="jpeg", quality=65, full_page=False, timeout=8000)
+        # Clip to viewport at 960px wide, 45% quality → keeps base64 under 150KB
+        clip = {"x": 0, "y": 0, "width": 1366, "height": 768}
+        buf  = await page.screenshot(type="jpeg", quality=45, full_page=False,
+                                      clip=clip, timeout=10000)
         b64 = base64.b64encode(buf).decode()
+        size_kb = len(b64) // 1024
+        print(f"[Screenshot] Step {step}: {size_kb}KB — {label}", flush=True)
+        # If still too large, re-shoot at lower quality
+        if size_kb > 400:
+            buf = await page.screenshot(type="jpeg", quality=25, full_page=False,
+                                         clip=clip, timeout=10000)
+            b64 = base64.b64encode(buf).decode()
+            print(f"[Screenshot] Re-compressed to {len(b64)//1024}KB", flush=True)
         log_screenshot(task_id, b64, label, supabase)
         return b64
     except Exception as e:
-        print(f"[Screenshot] Step {step}: {e}", flush=True)
+        print(f"[Screenshot] Step {step} FAILED: {e}", flush=True)
         return None
 
 
@@ -380,13 +391,22 @@ async def get_page_context(page, prompt: str, memory: List[str],
 
     mem_str = ("\nEXTRACTED SO FAR:\n" + "\n".join(f"  • {m[:200]}" for m in memory[-6:])) if memory else ""
     done_str = f"\nCOMPLETED STEPS: {', '.join(completed_extracts)} — DONE, do NOT re-extract." if completed_extracts else ""
-    next_hint = "\n⚡ IMPORTANT: Data already collected on this page — GOTO next URL or FINISH." \
-        if completed_extracts and last_extract_url == ctx.get("url", "") else ""
+    next_hint = ""
+    if completed_extracts and last_extract_url == ctx.get("url", ""):
+        next_hint = "\n🚨 DATA ALREADY EXTRACTED FROM THIS PAGE. GOTO next URL or FINISH immediately."
+    # Strong hint: if already on one of the prompt URLs, extract now
+    prompt_urls = re.findall(r'https?://[^\s'"<>)]+', prompt)
+    current_clean = ctx.get("url", "").rstrip("/").split("?")[0]
+    on_target = any(current_clean.startswith(u.rstrip("/").split("?")[0]) for u in prompt_urls)
+    if on_target and not memory:
+        next_hint += "\n✅ YOU ARE ALREADY ON THE TARGET PAGE. Do NOT navigate again. EXTRACT data NOW using EXTRACT action."
+    elif on_target and memory:
+        next_hint += "\n📊 You have data. If all required info is collected, use FINISH. If not, EXTRACT more."
 
     return f"""URL: {ctx['url']}
 TITLE: {ctx['title']}
 HEADINGS: {' | '.join(ctx.get('headings', [])[:3])}
-PAGE TEXT:\n{ctx.get('bodyText', '')[:1500]}
+PAGE TEXT:\n{ctx.get('bodyText', '')[:1800]}
 INPUTS: {json.dumps(ctx.get('inputs', [])[:6])}
 BUTTONS: {json.dumps(ctx.get('buttons', [])[:8])}
 LINKS: {json.dumps(ctx.get('links', [])[:6])}
@@ -441,7 +461,7 @@ async def run_agent(task_id: str, prompt: str,
 
     memory: List[str] = []
     steps_done = 0
-    max_steps  = 30
+    max_steps  = 50
     final_summary = ""
 
     async with async_playwright() as p:
@@ -506,25 +526,34 @@ async def run_agent(task_id: str, prompt: str,
         last_extract_url:  str        = ""
         extracted_urls:    List[str]  = []
 
-        SYSTEM_PROMPT = """You are AutoAgent Pro, an autonomous web browsing AI.
-Output ONLY a single JSON object. No markdown. No explanation. Just the JSON.
+        SYSTEM_PROMPT = """You are AutoAgent Pro — an expert autonomous browser agent.
+Output ONLY ONE valid JSON action object. No markdown, no explanation, no text. ONLY JSON.
 
-ACTIONS (pick ONE):
-{"action":"GOTO","url":"https://example.com","reason":"why"}
-{"action":"CLICK","selector":"a.link","reason":"why"}
-{"action":"TYPE","selector":"#search","text":"query","reason":"why"}
-{"action":"PRESS_KEY","key":"Enter","reason":"why"}
-{"action":"SCROLL","scrollY":500,"reason":"why"}
-{"action":"EXTRACT","js":"document.body.innerText","label":"name","reason":"why"}
-{"action":"WAIT","ms":2000,"reason":"why"}
-{"action":"FINISH","summary":"full summary of ALL data collected","reason":"done"}
+AVAILABLE ACTIONS:
+{"action":"GOTO","url":"https://example.com","reason":"..."}
+{"action":"CLICK","selector":"CSS_SELECTOR","reason":"..."}
+{"action":"TYPE","selector":"CSS_SELECTOR","text":"text to type","reason":"..."}
+{"action":"PRESS_KEY","key":"Enter","reason":"..."}
+{"action":"SCROLL","scrollY":500,"reason":"..."}
+{"action":"EXTRACT","js":"document.body.innerText.slice(0,2000)","label":"data_name","reason":"..."}
+{"action":"WAIT","ms":2000,"reason":"..."}
+{"action":"FINISH","summary":"complete summary of ALL data extracted","reason":"task complete"}
 
-RULES:
-- Output ONLY valid JSON starting with { ending with }
-- Use DOUBLE QUOTES for all strings
-- GOTO MUST include the full "url" field
-- After extracting data, GOTO next URL or FINISH
-- FINISH when ALL required data is collected"""
+CRITICAL RULES (follow strictly):
+1. Output ONLY raw JSON — no ``` markers, no text before/after
+2. Use DOUBLE QUOTES for all strings
+3. If you are ALREADY on the target URL: use EXTRACT immediately, NEVER use GOTO to the same URL
+4. Use EXTRACT to collect data from the current page before moving on
+5. After EXTRACTing data, either GOTO the next required URL or FINISH
+6. Use FINISH when ALL required information has been collected
+7. NEVER repeat the same action more than twice — if stuck, switch to EXTRACT or FINISH
+8. For HN stories: use js="Array.from(document.querySelectorAll('.athing')).map(el=>el.innerText).join('\n').slice(0,2000)"
+9. Good EXTRACT examples:
+   - Links: "Array.from(document.querySelectorAll('a')).slice(0,20).map(a=>a.textContent+':'+a.href).join('\n')"
+   - Text: "document.body.innerText.slice(0,3000)"
+   - Title: "document.title"
+   - HN titles: "Array.from(document.querySelectorAll('.titleline>a')).map(a=>a.textContent).join('\n')"
+"""
 
         while steps_done < max_steps:
             steps_done += 1
@@ -539,23 +568,47 @@ RULES:
             # Check CAPTCHA
             await handle_captcha(page, task_id, supabase, nopecha_key)
 
-            # Loop detection
-            if len(recent_actions) >= 4 and len(set(recent_actions[-4:])) == 1:
-                log(task_id, "⚠️ Loop detected — forcing finish", "warning", supabase)
-                final_summary = f"Loop detected after {steps_done} steps. Collected: {' | '.join(memory)}"
-                break
-            if consecutive_waits >= 5:
-                log(task_id, "⚠️ Too many WAITs — forcing finish", "warning", supabase)
-                final_summary = f"Timeout after {steps_done} steps. Collected: {' | '.join(memory)}"
+            # ── Loop detection (much stricter) ────────────────────────────
+            # Count how many of last 6 actions are the same TYPE
+            recent_types = [a.split(":")[0] for a in recent_actions[-6:]]
+            type_counts  = {t: recent_types.count(t) for t in set(recent_types)}
+            dominant_type = max(type_counts, key=type_counts.get) if type_counts else ""
+            dominant_count = type_counts.get(dominant_type, 0)
+
+            if dominant_count >= 4:
+                # Stuck in a loop — force EXTRACT if no data yet, else FINISH
+                log(task_id, f"⚠️ Loop detected ({dominant_type}×{dominant_count}) — forcing EXTRACT/FINISH", "warning", supabase)
+                if memory:
+                    final_summary = "Extracted data:\n" + "\n".join(f"• {m}" for m in memory)
+                    log(task_id, f"🏁 Forced finish with collected data", "success", supabase)
+                else:
+                    # Force an EXTRACT of whatever is on the page
+                    try:
+                        fallback = await page.evaluate("document.body.innerText.slice(0,2000)")
+                        memory.append(f"page_content: {str(fallback)[:800]}")
+                        final_summary = f"Forced extraction after loop\n\n{memory[0]}"
+                        log(task_id, f"📊 Forced page text extraction: {str(fallback)[:200]}", "success", supabase)
+                    except Exception as fe:
+                        final_summary = f"Loop detected — no data collected. Error: {fe}"
                 break
 
-            # Decide next action
+            if consecutive_waits >= 5:
+                log(task_id, "⚠️ Too many WAITs — forcing finish", "warning", supabase)
+                final_summary = f"Timeout. Collected: {' | '.join(memory)}"
+                break
+
+            # ── Decide next action ────────────────────────────────────────────
             action: Optional[dict] = None
             loop_hint = ""
             if consecutive_waits >= 2:
-                loop_hint = f"\n⚠️ Output ONLY raw JSON — no text before or after."
-            if len(recent_actions) >= 3 and len(set(recent_actions[-3:])) == 1:
-                loop_hint += f"\n⚠️ Same action repeated — try a DIFFERENT action type."
+                loop_hint = "\n⚠️ Output ONLY raw JSON — no text before or after."
+            if dominant_count >= 2:
+                loop_hint += (
+                    f"\n🚨 You have done {dominant_type} {dominant_count} times in a row. "
+                    f"Switch to a DIFFERENT action. If on target page, use EXTRACT."
+                )
+            if dominant_count >= 3:
+                loop_hint += "\n🔴 CRITICAL: Do NOT repeat the same action. Use EXTRACT or FINISH NOW."
 
             page_ctx = await get_page_context(page, prompt, memory, completed_extracts, last_extract_url)
             system = SYSTEM_PROMPT + loop_hint
@@ -628,16 +681,33 @@ RULES:
                     chosen = (unextracted or different or [None])[0]
                     if chosen: target = chosen; log(task_id, f"⚠️ GOTO missing url — auto: {target[:60]}", "warning", supabase)
                 if target:
-                    try:
-                        log(task_id, f"🌐 Navigating to {target[:80]}", "info", supabase)
-                        await page.goto(target, wait_until="domcontentloaded", timeout=30000)
-                        await asyncio.sleep(random.uniform(1.0, 2.3))
-                        await handle_captcha(page, task_id, supabase, nopecha_key)
-                        await capture_screenshot(page, task_id, steps_done, f"After GOTO {target[:40]}", supabase)
-                        recent_actions.clear()
-                    except Exception as e:
-                        log(task_id, f"Navigation error: {str(e)[:80]}", "warning", supabase)
-
+                    # Same-URL detection: skip no-op navigation, auto-EXTRACT instead
+                    cur_host = page.url.lower().split("/")[2] if "://" in page.url else ""
+                    tgt_host = target.lower().split("/")[2] if "://" in target else target.lower().split("/")[0]
+                    cur_path = "/".join(page.url.rstrip("/").split("/")[3:])
+                    tgt_path = "/".join(target.rstrip("/").split("/")[3:])
+                    same_page = (cur_host == tgt_host and cur_path == tgt_path)
+                    if same_page:
+                        log(task_id, f"⚠️ Already on target page — skipping GOTO, auto-EXTRACTing", "warning", supabase)
+                        try:
+                            extracted_text = await page.evaluate("document.body.innerText.slice(0,2000)")
+                            lbl = f"auto_extract_{steps_done}"
+                            memory.append(f"{lbl}: {str(extracted_text)[:800]}")
+                            if lbl not in completed_extracts: completed_extracts.append(lbl)
+                            last_extract_url = page.url
+                            log(task_id, f"📊 Auto-extracted (GOTO no-op): {str(extracted_text)[:200]}", "success", supabase)
+                        except Exception as ae:
+                            log(task_id, f"Auto-extract error: {str(ae)[:60]}", "warning", supabase)
+                    else:
+                        try:
+                            log(task_id, f"🌐 Navigating to {target[:80]}", "info", supabase)
+                            await page.goto(target, wait_until="domcontentloaded", timeout=30000)
+                            await asyncio.sleep(random.uniform(1.0, 2.3))
+                            await handle_captcha(page, task_id, supabase, nopecha_key)
+                            await capture_screenshot(page, task_id, steps_done, f"After GOTO {target[:40]}", supabase)
+                            recent_actions.clear()
+                        except Exception as e:
+                            log(task_id, f"Navigation error: {str(e)[:80]}", "warning", supabase)
             elif action_type == "CLICK":
                 selector = action.get("selector", "")
                 if selector:
