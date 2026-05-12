@@ -51,6 +51,7 @@ jobs:
           pip install --upgrade pip --quiet
           pip install \
             "browser-use==0.1.40" \
+            "langchain-cerebras>=0.1.0" \
             "langchain-openai>=0.2.0" \
             "langchain>=0.3.0" \
             "langchain-core>=0.3.0" \
@@ -67,6 +68,7 @@ jobs:
       - name: Validate environment
         run: |
           python -c "from browser_use import Agent; print('browser-use Agent OK')"
+          python -c "from langchain_cerebras import ChatCerebras; print('langchain-cerebras OK')"
           python -c "from langchain_openai import ChatOpenAI; print('langchain-openai OK')"
           python -c "from supabase import create_client; print('supabase OK')"
           python -c "import httpx; print('httpx OK')"
