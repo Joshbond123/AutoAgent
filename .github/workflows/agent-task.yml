@@ -26,28 +26,35 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update -q
-          sudo apt-get install -y -q chromium-browser chromium-chromedriver \
-            libglib2.0-0 libnss3 libgconf-2-4 libfontconfig1 \
-            libx11-xcb1 libxcomposite1 libxcursor1 libxdamage1 \
-            libxi6 libxtst6 libatk-bridge2.0-0 libgtk-3-0 libgbm1
+          sudo apt-get install -y -q \
+            chromium-browser \
+            libglib2.0-0 \
+            libnss3 \
+            libfontconfig1 \
+            libx11-xcb1 \
+            libxcomposite1 \
+            libxcursor1 \
+            libxdamage1 \
+            libxi6 \
+            libxtst6 \
+            libatk-bridge2.0-0 \
+            libgtk-3-0 \
+            libgbm1 \
+            libxrandr2 \
+            libxss1 \
+            libasound2t64 || true
 
       - name: Install Python packages
         run: |
           pip install --upgrade pip
-          pip install \
-            browser-use \
-            playwright \
-            langchain-google-genai \
-            supabase \
-            httpx \
-            python-dotenv
-          playwright install chromium
+          pip install playwright httpx supabase python-dotenv
+          pip install browser-use langchain-google-genai || true
+          playwright install chromium --with-deps
 
-      - name: Run pending tasks
+      - name: Run agent task
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           CEREBRAS_API_KEYS: ${{ secrets.CEREBRAS_API_KEYS }}
           NOPECHA_API_KEY: ${{ secrets.NOPECHA_API_KEY }}
           TASK_ID: ${{ github.event.inputs.task_id }}
