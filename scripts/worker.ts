@@ -4,67 +4,128 @@ import dotenv from "dotenv";
 
 dotenv.config();
 
-async function runWorker() {
-  const supabaseUrl = process.env.SUPABASE_URL || "";
-  const supabaseKey = process.env.SUPABASE_SERVICE_ROLE_KEY || "";
-  const supabase = createClient(supabaseUrl, supabaseKey);
+const SUPABASE_URL = process.env.SUPABASE_URL || "";
+const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || "";
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY || "";
+const NOPECHA_API_KEY = process.env.NOPECHA_API_KEY || "";
+const TASK_ID = process.env.TASK_ID || "";
 
-  const taskId = process.env.TASK_ID;
-  
-  let task;
-  if (taskId) {
-    const { data } = await supabase.from('tasks').select('*').eq('id', taskId).single();
-    task = data;
-  } else {
-    // If no specific task, pick up next pending task with a schedule
-    const { data } = await supabase
-      .from('tasks')
-      .select('*')
-      .eq('status', 'pending')
-      .order('created_at', { ascending: true })
-      .limit(1)
-      .single();
-    task = data;
+if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
+  console.error("Missing required environment variables: SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY");
+  process.exit(1);
+}
+
+const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
+
+async function log(taskId: string, message: string, type: "info" | "success" | "error" | "warning" = "info") {
+  console.log(`[${type.toUpperCase()}] ${message}`);
+  await supabase.from("task_logs").insert({ task_id: taskId, message, log_type: type });
+}
+
+async function runTask(taskId: string): Promise<void> {
+  console.log(`\n========== Running Task: ${taskId} ==========`);
+
+  const { data: task, error } = await supabase
+    .from("tasks")
+    .select("*")
+    .eq("id", taskId)
+    .single();
+
+  if (error || !task) {
+    console.error(`Task not found: ${taskId}`);
+    return;
   }
 
-  if (!task) {
+  await supabase
+    .from("tasks")
+    .update({ status: "running", last_run: new Date().toISOString() })
+    .eq("id", taskId);
+
+  await log(taskId, `Starting task: ${task.name}`, "info");
+
+  const agent = new AutonomousAgent({
+    taskId,
+    prompt: task.prompt,
+    geminiApiKey: GEMINI_API_KEY,
+    nopechaKey: NOPECHA_API_KEY,
+    onLog: async (message, type = "info") => {
+      await log(taskId, message, type);
+    },
+    onScreenshot: async (base64) => {
+      try {
+        const buffer = Buffer.from(base64, "base64");
+        const filename = `${taskId}/${Date.now()}.jpg`;
+        await supabase.storage.from("screenshots").upload(filename, buffer, { contentType: "image/jpeg" });
+      } catch (err) {
+        console.warn("Screenshot upload failed:", err);
+      }
+    },
+    maxSteps: 25,
+  });
+
+  const result = await agent.run();
+
+  await supabase
+    .from("tasks")
+    .update({
+      status: result.success ? "completed" : "failed",
+      result: {
+        success: result.success,
+        summary: result.summary,
+        stepCount: result.logs.length,
+        completedAt: new Date().toISOString(),
+      },
+      logs: result.logs.join("\n"),
+    })
+    .eq("id", taskId);
+
+  await log(
+    taskId,
+    result.success ? `Task completed: ${result.summary}` : `Task failed: ${result.summary}`,
+    result.success ? "success" : "error"
+  );
+
+  console.log(`Task ${taskId} finished. Success: ${result.success}`);
+}
+
+async function runPendingTasks(): Promise<void> {
+  console.log("Checking for pending/scheduled tasks...");
+
+  const { data: tasks, error } = await supabase
+    .from("tasks")
+    .select("*")
+    .in("status", ["pending", "scheduled"])
+    .order("created_at", { ascending: true })
+    .limit(3);
+
+  if (error) {
+    console.error("Error fetching tasks:", error);
+    return;
+  }
+
+  if (!tasks || tasks.length === 0) {
     console.log("No pending tasks found.");
     return;
   }
 
-  console.log(`Starting worker for task: ${task.name} (${task.id})`);
+  console.log(`Found ${tasks.length} pending task(s).`);
 
-  const geminiKey = process.env.GEMINI_API_KEY || "";
-  const cerebrasKeys = (process.env.CEREBRAS_API_KEYS || "").split(",").filter(k => !!k);
-
-  const agent = new AutonomousAgent(geminiKey, cerebrasKeys);
-  
-  agent.setLogCallback(async (msg, type) => {
-    console.log(`[${type}] ${msg}`);
-    // Optionally update logs in Supabase in chunks
-  });
-
-  try {
-    await agent.initialize({ headless: true });
-    await supabase.from('tasks').update({ status: 'running', last_run: new Date() }).eq('id', task.id);
-    
-    await agent.run(task.prompt);
-
-    await supabase.from('tasks').update({ 
-      status: 'completed',
-      updated_at: new Date()
-    }).eq('id', task.id);
-
-  } catch (err: any) {
-    console.error("Worker Execution Error:", err);
-    await supabase.from('tasks').update({ 
-      status: 'failed',
-      logs: err.message
-    }).eq('id', task.id);
-  } finally {
-    await agent.close();
-    process.exit(0);
+  // Process tasks sequentially to avoid resource conflicts
+  for (const task of tasks) {
+    await runTask(task.id);
   }
 }
 
-runWorker();
+// Main entry point
+async function main() {
+  if (TASK_ID) {
+    await runTask(TASK_ID);
+  } else {
+    await runPendingTasks();
+  }
+}
+
+main().catch(err => {
+  console.error("Worker fatal error:", err);
+  process.exit(1);
+});

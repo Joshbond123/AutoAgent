@@ -1,17 +1,25 @@
-name: Worker - Autonomous Task
+name: Worker - Autonomous Browser Agent
 
 on:
   schedule:
-    - cron: "*/5 * * * *" # Runs every 5 minutes
+    - cron: "*/10 * * * *"
   workflow_dispatch:
     inputs:
       taskId:
-        description: 'The ID of the task to run'
+        description: 'Task ID to run (empty = all pending)'
         required: false
+        default: ''
+      runtime:
+        description: 'Runtime to use (python=BrowserUse, node=Playwright)'
+        required: false
+        default: 'python'
 
 jobs:
   run-agent:
+    name: Execute Browser Agent
     runs-on: ubuntu-latest
+    timeout-minutes: 30
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -20,19 +28,70 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: '20'
+          cache: 'npm'
 
-      - name: Install dependencies
-        run: npm install
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install Python dependencies
+        run: |
+          pip install --upgrade pip
+          pip install browser-use langchain-google-genai supabase playwright
+          pip install nopecha-python || true
+
+      - name: Install Node dependencies
+        run: npm ci --ignore-scripts
 
       - name: Install Playwright Browsers
-        run: npx playwright install --with-deps chromium
+        run: |
+          python -m playwright install --with-deps chromium
+          npx playwright install --with-deps chromium
 
-      - name: Execute Agent
+      - name: Verify Setup
+        run: |
+          echo "Node: $(node --version)"
+          echo "Python: $(python --version)"
+          python -c "import browser_use; print('Browser Use:', browser_use.__version__)" 2>/dev/null || echo "Browser Use not available"
+          python -c "import playwright; print('Playwright OK')"
+
+      - name: Run Browser Agent (Python / Browser Use)
+        if: ${{ github.event.inputs.runtime != 'node' }}
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-          CEREBRAS_API_KEYS: ${{ secrets.CEREBRAS_API_KEYS }}
           NOPECHA_API_KEY: ${{ secrets.NOPECHA_API_KEY }}
           TASK_ID: ${{ github.event.inputs.taskId }}
+          DISPLAY: ":99"
+        run: |
+          # Run all pending tasks if no specific task ID
+          if [ -z "$TASK_ID" ]; then
+            echo "Running all pending tasks..."
+            python scripts/run_pending_tasks.py
+          else
+            echo "Running task: $TASK_ID"
+            python scripts/browser_use_worker.py "$TASK_ID"
+          fi
+
+      - name: Run Browser Agent (Node / Playwright fallback)
+        if: ${{ github.event.inputs.runtime == 'node' }}
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          NOPECHA_API_KEY: ${{ secrets.NOPECHA_API_KEY }}
+          TASK_ID: ${{ github.event.inputs.taskId }}
+          NODE_ENV: production
         run: npx tsx scripts/worker.ts
+
+      - name: Upload screenshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: agent-screenshots-${{ github.run_id }}
+          path: /tmp/agent_*.png
+          retention-days: 7
+          if-no-files-found: ignore
