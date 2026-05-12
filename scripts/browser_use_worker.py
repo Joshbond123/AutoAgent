@@ -189,8 +189,30 @@ async def cerebras_chat(pool: CerebrasPool, messages: list,
     raise RuntimeError("Cerebras: all models exhausted")
 
 
+def _parse_cf_response(data: dict) -> str:
+    """
+    Parse Cloudflare AI API response — handles both formats:
+      • New OpenAI-compatible: result.choices[0].message.content
+      • Legacy format:         result.response
+    """
+    result = data.get("result", {}) or {}
+    # OpenAI-compatible format (kimi-k2.6, llama, etc.)
+    choices = result.get("choices") or []
+    if choices and isinstance(choices, list):
+        msg = choices[0].get("message", {}) or {}
+        content = msg.get("content", "")
+        if content:
+            return content
+    # Legacy format
+    return result.get("response", "") or ""
+
+
 async def cloudflare_vision(cf: CloudflarePool, screenshot_b64: str, prompt_text: str) -> Optional[str]:
-    """Send screenshot + prompt to Cloudflare vision model. Rotates on failure."""
+    """
+    Send screenshot + prompt to Cloudflare vision model.
+    Tries data-URI base64 first; if the model returns 500 (unsupported),
+    falls back gracefully without marking the credential failed.
+    """
     if not cf.ready:
         return None
     cred = cf.next_credential()
@@ -199,7 +221,14 @@ async def cloudflare_vision(cf: CloudflarePool, screenshot_b64: str, prompt_text
     model = cred.model or cf.default_model
     url   = f"https://api.cloudflare.com/client/v4/accounts/{cred.account_id}/ai/run/{model}"
     hdrs  = {"Authorization": f"Bearer {cred.api_key}", "Content-Type": "application/json"}
-    body  = {
+
+    # Trim screenshot to max 800KB base64 (≈600KB JPEG) to stay under API limits
+    MAX_B64 = 800_000
+    if len(screenshot_b64) > MAX_B64:
+        screenshot_b64 = screenshot_b64[:MAX_B64]
+        print(f"[Cloudflare] Screenshot trimmed to {MAX_B64//1024}KB for vision API", flush=True)
+
+    body = {
         "messages": [{
             "role": "user",
             "content": [
@@ -211,20 +240,31 @@ async def cloudflare_vision(cf: CloudflarePool, screenshot_b64: str, prompt_text
     try:
         async with httpx.AsyncClient(timeout=60) as c:
             r = await c.post(url, headers=hdrs, json=body)
+
         if r.status_code in (429, 403, 401):
             cf.mark_failed(cred)
             return None
+
+        if r.status_code == 500:
+            # Model doesn't support base64 data-URI — don't mark failed (text still works)
+            print(f"[Cloudflare] Vision 500 for {cred.label} — model may not support base64 images", flush=True)
+            return None
+
         r.raise_for_status()
-        data = r.json()
-        return data.get("result", {}).get("response", "")
+        result = _parse_cf_response(r.json())
+        if result:
+            print(f"[Cloudflare] Vision OK ({cred.label}): {result[:80]}", flush=True)
+        return result or None
     except Exception as e:
         print(f"[Cloudflare] Vision error ({cred.label}): {e}", flush=True)
-        cf.mark_failed(cred)
+        # Only mark failed for network/auth errors, not model capability issues
+        if "401" in str(e) or "403" in str(e) or "429" in str(e):
+            cf.mark_failed(cred)
         return None
 
 
 async def cloudflare_text(cf: CloudflarePool, messages: list, system: str = "") -> Optional[str]:
-    """Call Cloudflare AI text-only. Rotates on failure."""
+    """Call Cloudflare AI text-only. Rotates on credential failure."""
     if not cf.ready:
         return None
     cred = cf.next_credential()
@@ -241,7 +281,10 @@ async def cloudflare_text(cf: CloudflarePool, messages: list, system: str = "") 
             cf.mark_failed(cred)
             return None
         r.raise_for_status()
-        return r.json().get("result", {}).get("response", "")
+        result = _parse_cf_response(r.json())
+        if result:
+            print(f"[Cloudflare] Text OK ({cred.label}): {result[:60]}", flush=True)
+        return result or None
     except Exception as e:
         print(f"[Cloudflare] Text error ({cred.label}): {e}", flush=True)
         cf.mark_failed(cred)
@@ -265,18 +308,38 @@ def log(task_id: str, message: str, log_type: str = "info", supabase=None):
 
 
 def log_screenshot(task_id: str, b64: str, label: str, supabase=None):
-    """Store screenshot as base64 in task_logs with log_type=screenshot."""
-    print(f"📸 Screenshot: {label}", flush=True)
-    if supabase and task_id:
-        try:
-            supabase.table("task_logs").insert({
-                "task_id":    task_id,
-                "message":    b64,  # raw base64 — UI renders as <img>
-                "log_type":   "screenshot",
-                "created_at": datetime.utcnow().isoformat(),
-            }).execute()
-        except Exception as e:
-            print(f"[WARN] screenshot log: {e}", flush=True)
+    """
+    Store screenshot as base64 in task_logs with log_type=screenshot.
+    Uses httpx directly (not the supabase Python client) to avoid issues
+    with large text payloads in the supabase-py library.
+    """
+    size_kb = len(b64) // 1024
+    print(f"📸 Screenshot ({size_kb}KB): {label}", flush=True)
+    if not (SUPABASE_URL and SUPABASE_SVC_KEY and task_id):
+        return
+    try:
+        import urllib.request as _ur
+        payload = json.dumps({
+            "task_id":    task_id,
+            "message":    b64,
+            "log_type":   "screenshot",
+            "created_at": datetime.utcnow().isoformat(),
+        }).encode("utf-8")
+        req = _ur.Request(
+            f"{SUPABASE_URL}/rest/v1/task_logs",
+            data=payload, method="POST",
+            headers={
+                "Authorization": f"Bearer {SUPABASE_SVC_KEY}",
+                "apikey":        SUPABASE_SVC_KEY,
+                "Content-Type":  "application/json",
+                "Prefer":        "return=minimal",
+            }
+        )
+        with _ur.urlopen(req, timeout=20) as r:
+            status = r.status
+        print(f"[Screenshot] Stored {size_kb}KB — HTTP {status}", flush=True)
+    except Exception as e:
+        print(f"[WARN] screenshot log failed: {e}", flush=True)
 
 
 # ── Screenshot Capture ─────────────────────────────────────────────────────────

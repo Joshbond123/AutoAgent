@@ -47,15 +47,17 @@ function nanoid(n = 12): string {
 }
 
 // ── Serialise/deserialise credentials ──────────────────────────────────────────
-function parseCFCredentials(raw: string[]): CFCredential[] {
-  return (raw || []).map(item => {
+/** Parse raw cloudflare_keys[] from DB, migrating legacy plain-key entries.
+ *  legacyAccountId: the cloudflare_account_id DB field (used for legacy keys). */
+function parseCFCredentials(raw: string[], legacyAccountId = ""): CFCredential[] {
+  return (raw || []).map((item, i) => {
     try {
       const parsed = JSON.parse(item);
       if (parsed && typeof parsed === "object" && parsed.api_key) {
         return {
           id:          parsed.id          || nanoid(),
-          label:       parsed.label       || "Account",
-          account_id:  parsed.account_id  || "",
+          label:       parsed.label       || `Account ${i + 1}`,
+          account_id:  parsed.account_id  || legacyAccountId,
           api_key:     parsed.api_key     || "",
           model:       parsed.model       || "@cf/moonshotai/kimi-k2.6",
           enabled:     parsed.enabled !== false,
@@ -64,17 +66,17 @@ function parseCFCredentials(raw: string[]): CFCredential[] {
           last_tested: parsed.last_tested || null,
         } as CFCredential;
       }
-    } catch { /* old plain-key format */ }
-    // Legacy: plain API key — account_id unknown, must be filled in
+    } catch { /* old plain-key format below */ }
+    // Legacy: plain API key string — migrate using legacyAccountId from DB
     return {
       id:          nanoid(),
-      label:       "Legacy Key",
-      account_id:  "",
+      label:       "Primary Account",
+      account_id:  legacyAccountId,   // populated from cloudflare_account_id DB field
       api_key:     item,
       model:       "@cf/moonshotai/kimi-k2.6",
       enabled:     true,
       test_status: "untested" as const,
-      test_msg:    "",
+      test_msg:    "Migrated from legacy format — account ID pre-filled from settings.",
       last_tested: null,
     };
   });
@@ -330,7 +332,11 @@ export default function SettingsPage({ onSettingsSaved }: { onSettingsSaved?: ()
         if (data) {
           setCerebrasKeys(data.cerebras_keys || []);
           setNopechaKey(data.nopecha_key || "");
-          setCfCreds(parseCFCredentials(data.cloudflare_keys || []));
+          // Pass cloudflare_account_id so legacy plain-key entries get migrated
+          setCfCreds(parseCFCredentials(
+            data.cloudflare_keys || [],
+            data.cloudflare_account_id || ""
+          ));
           setCfModel(data.cloudflare_model || "@cf/moonshotai/kimi-k2.6");
           setGithubToken(data.github_token || "");
         }
@@ -382,14 +388,20 @@ export default function SettingsPage({ onSettingsSaved }: { onSettingsSaved?: ()
         {
           method: "POST",
           headers: { Authorization: `Bearer ${cred.api_key}`, "Content-Type": "application/json" },
-          body: JSON.stringify({ messages: [{ role: "user", content: "Reply with: OK" }] }),
+          body: JSON.stringify({ messages: [{ role: "user", content: "Reply with exactly: AUTOAGENT_CF_OK" }] }),
         }
       );
       const data = await res.json();
-      const ok   = !!data?.result?.response;
-      const msg  = ok
-        ? `Connected — model replied: "${String(data.result.response).slice(0, 50)}"`
-        : `Error: ${JSON.stringify(data).slice(0, 100)}`;
+
+      // Handle both OpenAI-compatible (choices) and legacy (response) formats
+      const result   = data?.result || {};
+      const choices  = result?.choices;
+      const replyRaw = (choices?.[0]?.message?.content) || result?.response || "";
+      const reply    = String(replyRaw).trim();
+      const ok       = res.ok && !!reply;
+      const msg      = ok
+        ? `✅ Connected — model replied: "${reply.slice(0, 60)}"`
+        : `❌ Error (HTTP ${res.status}): ${JSON.stringify(data).slice(0, 120)}`;
 
       setCfCreds(prev => prev.map((c, i) => i === idx ? {
         ...c,
@@ -402,7 +414,7 @@ export default function SettingsPage({ onSettingsSaved }: { onSettingsSaved?: ()
       setCfCreds(prev => prev.map((c, i) => i === idx ? {
         ...c,
         test_status: "fail",
-        test_msg: msg.slice(0, 100),
+        test_msg: `❌ ${msg.slice(0, 120)}`,
         last_tested: new Date().toISOString(),
       } : c));
     }
