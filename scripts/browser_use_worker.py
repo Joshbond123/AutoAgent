@@ -1,13 +1,17 @@
 #!/usr/bin/env python3
 """
-AutoAgent Pro — Browser-Use Worker v7
+AutoAgent Pro — Browser-Use Worker v8
 ==============================================
-Primary LLM  : Cerebras via OpenAI-compatible API (ChatOpenAI with base_url)
-               OR langchain-cerebras (ChatCerebras) if available
-Fallback LLM : Cloudflare Workers AI text model
-Browser      : browser-use (Playwright, stealth, headless)
+Primary LLM  : Cerebras llama-3.3-70b via ChatCerebras (langchain-cerebras)
+               OR ChatOpenAI(base_url=CEREBRAS_BASE) fallback
+Fallback LLM : Cloudflare Workers AI text model (custom BaseChatModel wrapper)
+Browser      : browser-use (Playwright, headless) — version-agnostic setup
 Screenshots  : Streamed to Supabase task_logs in real-time
-Streaming    : Step-level callbacks log every agent action to Supabase
+
+API compatibility matrix:
+  browser-use 0.1.x/0.2.x : Browser(config=BrowserConfig(...))  old API
+  browser-use 0.11+/0.12+  : BrowserSession(browser_profile=BrowserProfile(...))
+  Fallback                  : Agent without explicit browser (agent creates its own)
 
 Integration references:
   https://inference-docs.cerebras.ai/integrations/browser-use
@@ -53,6 +57,8 @@ except ImportError:
     print("[WARN] supabase-py not installed — logs go to stdout only", flush=True)
 
 # browser-use import (version-agnostic)
+# Important: in 0.12.x+ Browser/BrowserConfig may be exported as None
+# (backward-compat placeholders) — we must check callable() after import.
 BROWSER_USE_OK       = False
 Agent                = None
 Browser              = None
@@ -61,19 +67,46 @@ BrowserContextConfig = None
 
 try:
     from browser_use import Agent
-    try:
-        from browser_use import Browser, BrowserConfig
-    except ImportError:
+    # ── Browser / BrowserConfig (old API 0.1.x-0.2.x) ──
+    # Try top-level first, then submodule; guard against None placeholders.
+    for _bu_path in (
+        ("browser_use",                "Browser", "BrowserConfig"),
+        ("browser_use.browser.browser","Browser", "BrowserConfig"),
+        ("browser_use.browser",        "Browser", "BrowserConfig"),
+    ):
         try:
-            from browser_use.browser.browser import Browser, BrowserConfig
-        except ImportError:
+            import importlib as _il
+            _m = _il.import_module(_bu_path[0])
+            _B  = getattr(_m, _bu_path[1], None)
+            _BC = getattr(_m, _bu_path[2], None)
+            if callable(_B) and callable(_BC):
+                Browser       = _B
+                BrowserConfig = _BC
+                print(f"[OK] Browser/BrowserConfig from {_bu_path[0]}", flush=True)
+                break
+        except Exception:
             pass
-    try:
-        from browser_use.browser.context import BrowserContextConfig
-    except ImportError:
-        pass
+    if Browser is None:
+        print("[INFO] Browser/BrowserConfig not found — will use BrowserSession or Agent-only mode", flush=True)
+
+    # ── BrowserContextConfig (optional, some 0.1.x versions) ──
+    for _ctx_path in (
+        "browser_use.browser.context",
+        "browser_use.browser",
+        "browser_use",
+    ):
+        try:
+            _cm = _il.import_module(_ctx_path)
+            _BCC = getattr(_cm, "BrowserContextConfig", None)
+            if callable(_BCC):
+                BrowserContextConfig = _BCC
+                break
+        except Exception:
+            pass
+
     BROWSER_USE_OK = True
-    print(f"[OK] browser-use imported (Agent={Agent is not None})", flush=True)
+    print(f"[OK] browser-use imported — Agent={Agent is not None}, "
+          f"Browser={Browser is not None}, BrowserConfig={BrowserConfig is not None}", flush=True)
 except ImportError as _e:
     print(f"[ERROR] browser-use not installed: {_e}", flush=True)
 
@@ -636,7 +669,11 @@ async def run_browser_use_agent(
     log(task_id, f"🤖 AI Engine: {llm_label}", "info", supabase)
     log(task_id, f"📋 Task: {prompt[:200]}{'…' if len(prompt) > 200 else ''}", "info", supabase)
 
-    # ── Browser configuration ──────────────────────────────────────────────────
+    # ── Browser setup (version-agnostic) ──────────────────────────────────────
+    # Headless env vars respected by browser-use 0.11+ and Playwright
+    os.environ.setdefault("BROWSER_HEADLESS", "true")
+    os.environ.setdefault("ANONYMIZED_TELEMETRY", "false")
+
     chromium_args = [
         "--no-sandbox",
         "--disable-setuid-sandbox",
@@ -648,40 +685,93 @@ async def run_browser_use_agent(
         "--no-first-run",
         "--disable-extensions",
         "--disable-background-networking",
-        "--disable-default-apps",
-        "--no-default-browser-check",
         "--hide-scrollbars",
         "--mute-audio",
-        "--disable-translate",
-        "--safebrowsing-disable-auto-update",
-        "--disable-sync",
     ]
 
-    browser_cfg_kwargs: dict = dict(
-        headless=True,
-        disable_security=False,
-        extra_chromium_args=chromium_args,
-    )
+    browser_obj = None  # Will be passed to Agent as browser= or browser_session=
 
-    # BrowserContextConfig (available in some versions)
-    if BrowserContextConfig is not None:
+    # Strategy A: browser-use 0.1.x / 0.2.x ─ Browser(config=BrowserConfig(...))
+    if Browser is not None and BrowserConfig is not None:
         try:
-            ctx_cfg = BrowserContextConfig(
-                wait_for_network_idle_page_load_time=2.0,
-                browser_window_size={"width": 1366, "height": 768},
+            cfg_kw: dict = dict(
+                headless=True,
+                disable_security=False,
+                extra_chromium_args=chromium_args,
             )
-            browser_cfg_kwargs["new_context_config"] = ctx_cfg
-        except Exception:
-            pass
+            # Optional context config
+            if BrowserContextConfig is not None:
+                try:
+                    cfg_kw["new_context_config"] = BrowserContextConfig(
+                        wait_for_network_idle_page_load_time=2.0,
+                        browser_window_size={"width": 1366, "height": 768},
+                    )
+                except Exception:
+                    pass
+            # Drop unknown kwargs one by one until constructor accepts them
+            drop_sequence = [None, "new_context_config", "disable_security", "extra_chromium_args"]
+            for drop in drop_sequence:
+                if drop:
+                    cfg_kw.pop(drop, None)
+                try:
+                    browser_obj = Browser(config=BrowserConfig(**cfg_kw))
+                    print(f"[Browser] Old API ready (Browser/BrowserConfig)", flush=True)
+                    break
+                except TypeError:
+                    continue
+        except Exception as e:
+            print(f"[Browser] Old API failed: {e}", flush=True)
+            browser_obj = None
 
-    try:
-        browser_cfg = BrowserConfig(**browser_cfg_kwargs)
-    except TypeError:
-        # Older versions may not support all kwargs
-        browser_cfg_kwargs.pop("new_context_config", None)
-        browser_cfg = BrowserConfig(**browser_cfg_kwargs)
+    # Strategy B: browser-use 0.11+ ─ BrowserSession / BrowserProfile
+    if browser_obj is None:
+        import importlib
+        for session_mod, profile_mod in [
+            ("browser_use.browser.browser", "browser_use.browser.profile"),
+            ("browser_use.browser",         "browser_use.browser"),
+            ("browser_use",                 "browser_use"),
+        ]:
+            try:
+                smod = importlib.import_module(session_mod)
+                _BrowserSession = getattr(smod, "BrowserSession", None)
+                if _BrowserSession is None:
+                    continue
+                # Try to build a profile with chromium args
+                pmod = importlib.import_module(profile_mod)
+                _BrowserProfile = (
+                    getattr(pmod, "BrowserProfile", None)
+                    or getattr(pmod, "DefaultBrowserProfile", None)
+                )
+                session_built = False
+                if _BrowserProfile is not None:
+                    for profile_kw in [
+                        dict(headless=True, extra_chromium_args=chromium_args),
+                        dict(headless=True),
+                        {},
+                    ]:
+                        try:
+                            _prof = _BrowserProfile(**profile_kw)
+                            browser_obj = _BrowserSession(browser_profile=_prof)
+                            session_built = True
+                            break
+                        except Exception:
+                            continue
+                if not session_built:
+                    for session_kw in [dict(headless=True), {}]:
+                        try:
+                            browser_obj = _BrowserSession(**session_kw)
+                            session_built = True
+                            break
+                        except Exception:
+                            continue
+                if session_built and browser_obj is not None:
+                    print(f"[Browser] New API ready (BrowserSession from {session_mod})", flush=True)
+                    break
+            except Exception:
+                continue
 
-    browser = Browser(config=browser_cfg)
+    if browser_obj is None:
+        print("[Browser] No explicit browser object — Agent will create its own", flush=True)
 
     # ── Step tracking ──────────────────────────────────────────────────────────
     step_count     = [0]
@@ -772,30 +862,61 @@ async def run_browser_use_agent(
     try:
         log(task_id, "🚀 Launching browser-use agent…", "info", supabase)
 
-        # Build Agent kwargs — probe callback kwarg name (varies by version)
-        agent_kwargs: dict = dict(
-            task=prompt,
-            llm=llm,
-            browser=browser,
-            max_failures=5,
-        )
+        # ── Introspect Agent.__init__ to build valid kwargs ───────────────────
+        import inspect as _inspect
+        try:
+            _agent_params = set(_inspect.signature(Agent.__init__).parameters.keys())
+        except Exception:
+            _agent_params = set()  # unknown — try everything
+        print(f"[Agent] Known params: {sorted(_agent_params)[:20]}", flush=True)
 
-        # Try each known callback kwarg name
+        def _agent_accepts(name: str) -> bool:
+            return not _agent_params or name in _agent_params or "kwargs" in str(_agent_params)
+
+        # Build base kwargs
+        agent_base_kwargs: dict = dict(task=prompt, llm=llm)
+
+        # max_failures / max_actions
+        for mf_name in ("max_failures", "max_actions"):
+            if _agent_accepts(mf_name):
+                agent_base_kwargs[mf_name] = 5
+                print(f"[Agent] Failures kwarg: {mf_name}", flush=True)
+                break
+
+        # browser / browser_session
+        if browser_obj is not None:
+            for br_name in ("browser", "browser_session"):
+                if _agent_accepts(br_name):
+                    agent_base_kwargs[br_name] = browser_obj
+                    print(f"[Agent] Browser kwarg: {br_name}", flush=True)
+                    break
+            else:
+                print("[Agent] No browser kwarg found in Agent — agent creates own browser", flush=True)
+        else:
+            print("[Agent] No browser object — agent creates own browser", flush=True)
+
+        agent_kwargs = dict(agent_base_kwargs)
+
+        # ── Probe callback kwarg name ──────────────────────────────────────────
         agent = None
         for cb_kwarg in ("register_new_step_callback", "on_step_start", "step_callback"):
+            if not _agent_accepts(cb_kwarg):
+                continue
             try:
                 test_kwargs = {**agent_kwargs, cb_kwarg: on_step}
                 agent = Agent(**test_kwargs)
                 agent_kwargs = test_kwargs
                 print(f"[Agent] Using callback kwarg: {cb_kwarg}", flush=True)
                 break
-            except TypeError:
-                pass
+            except TypeError as _te:
+                print(f"[Agent] {cb_kwarg} TypeError: {_te}", flush=True)
+            except Exception as _ex:
+                print(f"[Agent] {cb_kwarg} error: {_ex}", flush=True)
 
         if agent is None:
             # No callback support — run without it
             agent = Agent(**agent_kwargs)
-            print("[Agent] Running without step callback (version may not support it)", flush=True)
+            print("[Agent] Running without step callback", flush=True)
 
         # Capture browser reference for manual screenshots
         for attr in ("browser", "_browser", "browser_session", "_browser_session"):

@@ -73,6 +73,28 @@ jobs:
           echo "=== Package versions ==="
           pip show browser-use langchain-openai langchain-cerebras langchain pydantic 2>/dev/null | grep -E "^(Name|Version):" || true
 
+          echo "=== browser-use API probe ==="
+          python -c "
+          import importlib, inspect
+          bu = importlib.import_module('browser_use')
+          print('browser_use exports:', [x for x in dir(bu) if not x.startswith('_')])
+          Agent = getattr(bu, 'Agent', None)
+          if Agent:
+              params = list(inspect.signature(Agent.__init__).parameters.keys())
+              print('Agent.__init__ params:', params)
+          # Check if Browser/BrowserConfig are callable or None
+          B  = getattr(bu, 'Browser', None)
+          BC = getattr(bu, 'BrowserConfig', None)
+          print('Browser callable:', callable(B))
+          print('BrowserConfig callable:', callable(BC))
+          # Check for BrowserSession (new API)
+          try:
+              from browser_use.browser.browser import BrowserSession
+              print('BrowserSession available: YES')
+          except Exception as e:
+              print('BrowserSession available: NO -', e)
+          " 2>&1 || true
+
       - name: Install Playwright browser (Chromium)
         run: playwright install chromium --with-deps
 
