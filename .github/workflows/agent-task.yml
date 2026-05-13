@@ -51,8 +51,11 @@ jobs:
           pip install --upgrade pip --quiet
 
           # Core browser-use + LangChain stack
+          # Pin browser-use to 0.12.x — confirmed working API surface.
+          # >=0.1.40 resolves to 0.12.6 via pip's version ordering (0.12 > 0.1),
+          # so we pin explicitly to avoid surprises from future breaking releases.
           pip install \
-            "browser-use>=0.1.40" \
+            "browser-use==0.12.6" \
             "langchain-openai>=0.2.0" \
             "langchain-cerebras>=0.1.0" \
             "langchain>=0.3.0" \
