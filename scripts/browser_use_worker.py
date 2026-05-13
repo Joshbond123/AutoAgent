@@ -1056,28 +1056,70 @@ async def run_browser_use_agent(
                 agent_base_kwargs[si_kwarg] = False
                 break
 
-        # ── extend_system_message: fix common LLM schema mistakes ─────────────
-        # llama3.1-8b frequently generates {"wait":{"timeout":N}} which fails
-        # Pydantic validation (45 errors) because WaitParams uses "seconds" not
-        # "timeout".  Without this correction the agent exhausts max_failures and
-        # returns 0 completed steps.
+        # ── extend_system_message: fix schema mismatches in llama3.1-8b ─────────
+        # Two confirmed field-name bugs (from live GitHub Actions logs):
+        #   1. wait:    model uses {"wait":{"timeout":N}} → must be {"wait":{"seconds":N}}
+        #   2. extract: model uses {"extract":{"goal":"…"}} → must be {"extract":{"query":"…"}}
+        # Without these corrections the agent exhausts max_failures and stops.
+        # Note: all JSON keys MUST be strings; integer keys also cause json_invalid errors.
         SCHEMA_CORRECTION = (
-            "\n\nCRITICAL — EXACT ACTION FIELD NAMES (use these precisely):\n"
-            '• Wait:     {"wait": {"seconds": N}}          ← "seconds", NOT "timeout"\n'
-            '• Navigate: {"navigate": {"url": "...", "new_tab": false}}\n'
-            '• Click:    {"click": {"index": N}}\n'
-            '• Input:    {"input": {"index": N, "text": "..."}}\n'
-            '• Scroll:   {"scroll": {"down": true, "pages": 1.0}}\n'
-            '• Done:     {"done": {"text": "..."}}\n'
-            '• Extract:  {"extract": {"goal": "..."}}\n'
-            "If you want to pause/wait, you MUST use 'seconds' as the field name.\n"
-            "NEVER use 'timeout', 'ms', 'delay', or any other field name for waiting."
+            "\n\n=== CRITICAL: EXACT ACTION SCHEMAS — follow precisely or the step fails ===\n"
+            "Use ONLY these action types with EXACTLY these field names:\n"
+            '  {"wait":     {"seconds": N}}                     seconds=integer, NOT timeout/ms/delay\n'
+            '  {"navigate": {"url": "https://...", "new_tab": false}}\n'
+            '  {"click":    {"index": N}}                       N = element index integer\n'
+            '  {"input":    {"index": N, "text": "value"}}\n'
+            '  {"scroll":   {"down": true, "pages": 1.0}}\n'
+            '  {"extract":  {"query": "what to extract"}}       query=string, NOT goal/task/data\n'
+            '  {"done":     {"text": "full result summary"}}\n'
+            "Rules:\n"
+            "- ALL JSON keys must be quoted strings. NEVER use integer keys (e.g. {1: ...}).\n"
+            "- Do NOT add extra fields — only the fields shown above are allowed.\n"
+            "- To report extracted data, use the done action with text containing all results.\n"
+            "- Do NOT embed lists or dicts inside extract — only a plain string query.\n"
+            "=== END ACTION SCHEMAS ==="
         )
-        for ext_kwarg in ("extend_system_message", "override_system_message"):
-            if _agent_accepts(ext_kwarg) and ext_kwarg == "extend_system_message":
+        for ext_kwarg in ("extend_system_message",):
+            if _agent_accepts(ext_kwarg):
                 agent_base_kwargs[ext_kwarg] = SCHEMA_CORRECTION
-                print(f"[Agent] Schema correction injected via {ext_kwarg}", flush=True)
+                print(f"[Agent] Schema correction v2 injected via {ext_kwarg}", flush=True)
                 break
+
+        # ── Reduce context size to stay within 8k token limit ─────────────────
+        for attr_kwarg in ("include_attributes",):
+            if _agent_accepts(attr_kwarg):
+                # Only include essential attributes — omit class/style/aria bloat
+                agent_base_kwargs[attr_kwarg] = ["id", "name", "href", "type", "value", "placeholder"]
+                print(f"[Agent] Attribute filter: {attr_kwarg}", flush=True)
+                break
+        for hist_kwarg in ("max_history_items",):
+            if _agent_accepts(hist_kwarg):
+                agent_base_kwargs[hist_kwarg] = 8
+                print(f"[Agent] History cap: {hist_kwarg}=8", flush=True)
+                break
+
+        # ── fallback_llm: Cloudflare Workers AI via OpenAI-compat endpoint ────
+        # When Cerebras returns 429 (rate limit) or repeated schema errors,
+        # browser-use 0.12.6 will automatically retry with fallback_llm.
+        # Cloudflare exposes an OpenAI-compatible API at /ai/v1 so we can use
+        # the same BUChatOpenAI class — no extra LangChain wrapper needed.
+        if _agent_accepts("fallback_llm") and BU_NATIVE_CHAT_OK and BUChatOpenAI is not None:
+            if cf_account_id and cf_api_key:
+                try:
+                    _cf_bu_llm = BUChatOpenAI(
+                        model=cf_model.split("/")[-1] if "/" in cf_model else cf_model,
+                        api_key=cf_api_key,
+                        base_url=f"https://api.cloudflare.com/client/v4/accounts/{cf_account_id}/ai/v1",
+                        temperature=0.0,
+                        max_completion_tokens=2048,
+                        dont_force_structured_output=True,
+                        add_schema_to_system_prompt=False,
+                        max_retries=2,
+                    )
+                    agent_base_kwargs["fallback_llm"] = _cf_bu_llm
+                    print(f"[Agent] Fallback LLM: Cloudflare/{cf_model.split('/')[-1]}", flush=True)
+                except Exception as _fe:
+                    print(f"[Agent] Fallback LLM setup failed: {_fe}", flush=True)
 
         # ── loop_detection: disable to avoid false early stops ────────────────
         for ld_kwarg in ("loop_detection_enabled",):
@@ -1393,7 +1435,7 @@ if __name__ == "__main__":
 
     task_id = sys.argv[1].strip()
     print(f"\n{'=' * 60}", flush=True)
-    print(f"[AutoAgent Pro] browser-use worker v10 (schema-fix + llama3.1-8b)", flush=True)
+    print(f"[AutoAgent Pro] browser-use worker v11 (extract.query fix + fallback_llm + attr filter)", flush=True)
     print(f"[AutoAgent Pro] Task ID: {task_id}", flush=True)
     print(f"{'=' * 60}\n", flush=True)
 
