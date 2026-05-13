@@ -335,7 +335,13 @@ def make_cerebras_llm(api_key: str, model: str):
     if CEREBRAS_LANGCHAIN_OK and ChatCerebras is not None:
         try:
             class _CerebrasJSONMode(ChatCerebras):
-                """ChatCerebras with JSON-mode structured output override."""
+                """ChatCerebras with JSON-mode structured output override.
+                provider field is required by browser-use 0.12+ Agent.__init__.
+                """
+                # browser-use 0.12+ checks llm.provider to route model calls.
+                # Any value other than 'browser-use' causes it to use the LLM directly.
+                provider: str = "openai"
+
                 def with_structured_output(self, schema, *, include_raw=False, **kwargs):
                     return wso(self, schema, include_raw=include_raw, **kwargs)
 
@@ -354,11 +360,13 @@ def make_cerebras_llm(api_key: str, model: str):
     if LANGCHAIN_OK and ChatOpenAI is not None:
         try:
             class _CerebrasOpenAICompat(ChatOpenAI):
-                """
-                ChatOpenAI pointed at Cerebras API with JSON-mode structured
-                output override.
+                """ChatOpenAI pointed at Cerebras API with JSON-mode override.
+                provider field is required by browser-use 0.12+ Agent.__init__.
                 Ref: https://inference-docs.cerebras.ai/integrations/browser-use
                 """
+                # browser-use 0.12+ checks llm.provider — must not be 'browser-use'
+                provider: str = "openai"
+
                 def with_structured_output(self, schema, *, include_raw=False, **kwargs):
                     return wso(self, schema, include_raw=include_raw, **kwargs)
 
@@ -420,6 +428,8 @@ def make_cloudflare_llm(account_id: str, api_key: str, model: str):
             account_id: str
             api_key: str
             model: str
+            # browser-use 0.12+ checks llm.provider — must not be 'browser-use'
+            provider: str = "openai"
 
             @property
             def _llm_type(self) -> str:
@@ -883,15 +893,19 @@ async def run_browser_use_agent(
                 print(f"[Agent] Failures kwarg: {mf_name}", flush=True)
                 break
 
-        # browser / browser_session
+        # browser= vs browser_session=
+        # Prefer browser_session= for BrowserSession objects (new API 0.11+),
+        # prefer browser= for old Browser objects.
         if browser_obj is not None:
-            for br_name in ("browser", "browser_session"):
+            obj_cls_name = type(browser_obj).__name__
+            kwarg_order = ("browser_session", "browser") if "Session" in obj_cls_name else ("browser", "browser_session")
+            for br_name in kwarg_order:
                 if _agent_accepts(br_name):
                     agent_base_kwargs[br_name] = browser_obj
-                    print(f"[Agent] Browser kwarg: {br_name}", flush=True)
+                    print(f"[Agent] Browser kwarg: {br_name} (obj={obj_cls_name})", flush=True)
                     break
             else:
-                print("[Agent] No browser kwarg found in Agent — agent creates own browser", flush=True)
+                print("[Agent] No browser kwarg in Agent params — agent creates own browser", flush=True)
         else:
             print("[Agent] No browser object — agent creates own browser", flush=True)
 
@@ -1045,7 +1059,7 @@ async def run_task(task_id: str):
         return
 
     update_task_status(task_id, "running", None, supabase)
-    log(task_id, "🚀 AutoAgent Pro starting — browser-use engine v7", "info", supabase)
+    log(task_id, "🚀 AutoAgent Pro starting — browser-use engine v8", "info", supabase)
 
     # ── Load user settings from Supabase ──────────────────────────────────────
     cerebras_keys: List[str] = []
@@ -1187,7 +1201,7 @@ if __name__ == "__main__":
 
     task_id = sys.argv[1].strip()
     print(f"\n{'=' * 60}", flush=True)
-    print(f"[AutoAgent Pro] browser-use worker v7", flush=True)
+    print(f"[AutoAgent Pro] browser-use worker v8", flush=True)
     print(f"[AutoAgent Pro] Task ID: {task_id}", flush=True)
     print(f"{'=' * 60}\n", flush=True)
 
