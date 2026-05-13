@@ -346,8 +346,13 @@ def make_cerebras_llm(api_key: str, model: str):
                 base_url=CEREBRAS_BASE,
                 temperature=0.0,
                 max_completion_tokens=8192,
-                # Compatibility flags: Cerebras supports JSON schema response_format,
-                # but setting these avoids schema compatibility issues if it doesn't.
+                # Cerebras rejects response_format schemas that include
+                # minLength/maxLength on string fields (code: wrong_api_format).
+                # Setting dont_force_structured_output=True makes browser-use
+                # inject the JSON schema as a system-prompt instruction instead
+                # of using the response_format API parameter.
+                dont_force_structured_output=True,
+                add_schema_to_system_prompt=True,
                 remove_min_items_from_schema=True,
                 remove_defaults_from_schema=True,
             )
