@@ -336,11 +336,18 @@ def make_cerebras_llm(api_key: str, model: str):
         try:
             class _CerebrasJSONMode(ChatCerebras):
                 """ChatCerebras with JSON-mode structured output override.
-                provider field is required by browser-use 0.12+ Agent.__init__.
+                provider: browser-use 0.12+ checks llm.provider == 'browser-use'.
+                __setattr__: browser-use 0.12+ monkey-patches ainvoke/acall on the
+                  LLM instance (token cost service); Pydantic blocks this by default,
+                  so we fall back to object.__setattr__ for unknown fields.
                 """
-                # browser-use 0.12+ checks llm.provider to route model calls.
-                # Any value other than 'browser-use' causes it to use the LLM directly.
                 provider: str = "openai"
+
+                def __setattr__(self, name: str, value) -> None:
+                    try:
+                        super().__setattr__(name, value)
+                    except (ValueError, TypeError):
+                        object.__setattr__(self, name, value)
 
                 def with_structured_output(self, schema, *, include_raw=False, **kwargs):
                     return wso(self, schema, include_raw=include_raw, **kwargs)
@@ -360,12 +367,18 @@ def make_cerebras_llm(api_key: str, model: str):
     if LANGCHAIN_OK and ChatOpenAI is not None:
         try:
             class _CerebrasOpenAICompat(ChatOpenAI):
-                """ChatOpenAI pointed at Cerebras API with JSON-mode override.
-                provider field is required by browser-use 0.12+ Agent.__init__.
+                """ChatOpenAI → Cerebras base_url with JSON-mode override.
+                provider: required by browser-use 0.12+ Agent.__init__.
+                __setattr__: allows browser-use token service monkey-patching.
                 Ref: https://inference-docs.cerebras.ai/integrations/browser-use
                 """
-                # browser-use 0.12+ checks llm.provider — must not be 'browser-use'
                 provider: str = "openai"
+
+                def __setattr__(self, name: str, value) -> None:
+                    try:
+                        super().__setattr__(name, value)
+                    except (ValueError, TypeError):
+                        object.__setattr__(self, name, value)
 
                 def with_structured_output(self, schema, *, include_raw=False, **kwargs):
                     return wso(self, schema, include_raw=include_raw, **kwargs)
@@ -430,6 +443,12 @@ def make_cloudflare_llm(account_id: str, api_key: str, model: str):
             model: str
             # browser-use 0.12+ checks llm.provider — must not be 'browser-use'
             provider: str = "openai"
+
+            def __setattr__(self, name: str, value) -> None:
+                try:
+                    super().__setattr__(name, value)
+                except (ValueError, TypeError):
+                    object.__setattr__(self, name, value)
 
             @property
             def _llm_type(self) -> str:
