@@ -1035,11 +1035,12 @@ async def run_browser_use_agent(
 
         # Limit DOM elements sent per step to stay within Cerebras context window.
         # llama3.1-8b has 8192-token total limit; without capping DOM, the agent
-        # easily sends 9000+ tokens per step.
+        # easily sends 9000+ tokens per step causing Cerebras 502 errors.
+        # Reduced from 20→8: quotes.toscrape.com page DOM was still causing 502s at 20.
         for elem_kwarg in ("max_clickable_elements_length",):
             if _agent_accepts(elem_kwarg):
-                agent_base_kwargs[elem_kwarg] = 20
-                print(f"[Agent] DOM cap kwarg: {elem_kwarg}=20", flush=True)
+                agent_base_kwargs[elem_kwarg] = 8
+                print(f"[Agent] DOM cap kwarg: {elem_kwarg}=8", flush=True)
                 break
 
         # Cerebras llama3.1-8b is text-only — it cannot process image_url content.
@@ -1106,8 +1107,11 @@ async def run_browser_use_agent(
         if _agent_accepts("fallback_llm") and BU_NATIVE_CHAT_OK and BUChatOpenAI is not None:
             if cf_account_id and cf_api_key:
                 try:
+                    # Cloudflare OpenAI-compat endpoint requires the FULL model path
+                    # (e.g. "@cf/meta/llama-3.3-70b-instruct-fp8-fast"), NOT just the
+                    # last segment.  Splitting was the bug causing 400 "No such model".
                     _cf_bu_llm = BUChatOpenAI(
-                        model=cf_model.split("/")[-1] if "/" in cf_model else cf_model,
+                        model=cf_model,  # full path — do NOT split
                         api_key=cf_api_key,
                         base_url=f"https://api.cloudflare.com/client/v4/accounts/{cf_account_id}/ai/v1",
                         temperature=0.0,
@@ -1117,7 +1121,7 @@ async def run_browser_use_agent(
                         max_retries=2,
                     )
                     agent_base_kwargs["fallback_llm"] = _cf_bu_llm
-                    print(f"[Agent] Fallback LLM: Cloudflare/{cf_model.split('/')[-1]}", flush=True)
+                    print(f"[Agent] Fallback LLM: Cloudflare/{cf_model}", flush=True)
                 except Exception as _fe:
                     print(f"[Agent] Fallback LLM setup failed: {_fe}", flush=True)
 
@@ -1435,7 +1439,7 @@ if __name__ == "__main__":
 
     task_id = sys.argv[1].strip()
     print(f"\n{'=' * 60}", flush=True)
-    print(f"[AutoAgent Pro] browser-use worker v11 (extract.query fix + fallback_llm + attr filter)", flush=True)
+    print(f"[AutoAgent Pro] browser-use worker v12 (CF full model path + DOM cap 8 + extract.query)", flush=True)
     print(f"[AutoAgent Pro] Task ID: {task_id}", flush=True)
     print(f"{'=' * 60}\n", flush=True)
 
