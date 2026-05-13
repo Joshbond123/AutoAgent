@@ -523,6 +523,34 @@ def make_cloudflare_llm(account_id: str, api_key: str, model: str):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# LLM probe — verify the model actually works before handing to the agent.
+# browser-use native ChatOpenAI (and LangChain) create client objects without
+# making any API calls, so a model_not_found 404 only surfaces during agent
+# execution.  Probing here lets us fall through to the next model in the list.
+# ─────────────────────────────────────────────────────────────────────────────
+async def probe_llm(llm) -> bool:
+    """
+    Make a tiny test call to confirm the model exists and the key is valid.
+    Returns True if the call succeeds (or fails for a non-model reason),
+    False if the response is a 404 model-not-found or auth error.
+    """
+    try:
+        if BU_NATIVE_CHAT_OK and BUChatOpenAI is not None and isinstance(llm, BUChatOpenAI):
+            from browser_use.llm.messages import UserMessage as _BUMsg
+            resp = await llm.ainvoke([_BUMsg(content="Say OK in 2 words.")], output_format=None)
+            print(f"[LLM Probe] OK — model={llm.model}", flush=True)
+            return True
+    except Exception as e:
+        err = str(e)
+        if any(x in err for x in ("404", "not_found_error", "does not exist", "401", "403", "Unauthorized")):
+            print(f"[LLM Probe] Model/auth failed ({llm.model if hasattr(llm, 'model') else '?'}): {err[:200]}", flush=True)
+            return False
+        # Unknown error — let the agent try anyway (may be transient)
+        print(f"[LLM Probe] Non-fatal error: {err[:200]}", flush=True)
+    return True  # LangChain or unrecognised LLM — assume ok
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Cerebras key pool
 # ─────────────────────────────────────────────────────────────────────────────
 class CerebrasPool:
@@ -699,7 +727,7 @@ async def run_browser_use_agent(
     llm_label = ""
     used_key  = None
 
-    if cerebras_pool and cerebras_pool.size > 0 and (CEREBRAS_LANGCHAIN_OK or LANGCHAIN_OK):
+    if cerebras_pool and cerebras_pool.size > 0 and (BU_NATIVE_CHAT_OK or CEREBRAS_LANGCHAIN_OK or LANGCHAIN_OK):
         key = cerebras_pool.next_key()
         if key:
             used_key = key
@@ -707,6 +735,10 @@ async def run_browser_use_agent(
                 try:
                     candidate = make_cerebras_llm(api_key=key, model=model)
                     if candidate is not None:
+                        # Probe: verify model exists before committing
+                        if not await probe_llm(candidate):
+                            log(task_id, f"⚠️ Cerebras {model} unavailable — trying next model", "warning", supabase)
+                            continue
                         llm       = candidate
                         llm_label = f"Cerebras/{model}"
                         log(task_id, f"⚡ Using Cerebras LLM: {model}", "info", supabase)
