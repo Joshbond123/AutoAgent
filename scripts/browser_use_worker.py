@@ -348,11 +348,15 @@ def make_cerebras_llm(api_key: str, model: str):
                 max_completion_tokens=8192,
                 # Cerebras rejects response_format schemas that include
                 # minLength/maxLength on string fields (code: wrong_api_format).
-                # Setting dont_force_structured_output=True makes browser-use
-                # inject the JSON schema as a system-prompt instruction instead
-                # of using the response_format API parameter.
+                # dont_force_structured_output=True — browser-use won't use
+                # response_format API parameter; relies on system prompt instead.
+                # add_schema_to_system_prompt=False — keep system prompt compact;
+                # llama3.1-8b has an 8192-token total context window and the
+                # injected JSON schema tips it over (9355 > 8192 token error).
+                # browser-use's existing system prompt already describes the
+                # required JSON output format (AgentOutput schema).
                 dont_force_structured_output=True,
-                add_schema_to_system_prompt=True,
+                add_schema_to_system_prompt=False,
                 remove_min_items_from_schema=True,
                 remove_defaults_from_schema=True,
             )
@@ -981,6 +985,15 @@ async def run_browser_use_agent(
             if _agent_accepts(mf_name):
                 agent_base_kwargs[mf_name] = 5
                 print(f"[Agent] Failures kwarg: {mf_name}", flush=True)
+                break
+
+        # Limit DOM elements sent per step to stay within Cerebras context window.
+        # llama3.1-8b has 8192-token total limit; without capping DOM, the agent
+        # easily sends 9000+ tokens per step.
+        for elem_kwarg in ("max_clickable_elements_length",):
+            if _agent_accepts(elem_kwarg):
+                agent_base_kwargs[elem_kwarg] = 20
+                print(f"[Agent] DOM cap kwarg: {elem_kwarg}=20", flush=True)
                 break
 
         # browser= vs browser_session=
