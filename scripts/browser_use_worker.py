@@ -30,9 +30,9 @@ import urllib.request as _ur
 CEREBRAS_BASE    = "https://api.cerebras.ai/v1"
 SCREENSHOT_EVERY = 2  # capture a screenshot every N agent steps
 
-# Model priority — llama-3.3-70b has the best structured-output support
+# Model priority — Cerebras model IDs use no dash between "llama" and version
 CEREBRAS_MODELS = [
-    "llama-3.3-70b",
+    "llama3.3-70b",
     "llama3.1-8b",
 ]
 
