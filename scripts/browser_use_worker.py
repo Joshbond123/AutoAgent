@@ -30,9 +30,9 @@ import urllib.request as _ur
 CEREBRAS_BASE    = "https://api.cerebras.ai/v1"
 SCREENSHOT_EVERY = 2  # capture a screenshot every N agent steps
 
-# Model priority — Cerebras model IDs use no dash between "llama" and version
+# Model priority — confirmed working Cerebras model IDs (as of May 2026)
+# llama3.3-70b / llama-3.3-70b both return 404 on most accounts; llama3.1-8b is stable.
 CEREBRAS_MODELS = [
-    "llama3.3-70b",
     "llama3.1-8b",
 ]
 
@@ -340,26 +340,44 @@ def make_cerebras_llm(api_key: str, model: str):
     # ── Strategy 0: browser-use native ChatOpenAI → Cerebras ──────────────────
     if BU_NATIVE_CHAT_OK and BUChatOpenAI is not None:
         try:
-            llm = BUChatOpenAI(
-                model=model,
-                api_key=api_key,
-                base_url=CEREBRAS_BASE,
-                temperature=0.0,
-                max_completion_tokens=8192,
-                # Cerebras rejects response_format schemas that include
-                # minLength/maxLength on string fields (code: wrong_api_format).
-                # dont_force_structured_output=True — browser-use won't use
-                # response_format API parameter; relies on system prompt instead.
-                # add_schema_to_system_prompt=False — keep system prompt compact;
-                # llama3.1-8b has an 8192-token total context window and the
-                # injected JSON schema tips it over (9355 > 8192 token error).
-                # browser-use's existing system prompt already describes the
-                # required JSON output format (AgentOutput schema).
-                dont_force_structured_output=True,
-                add_schema_to_system_prompt=False,
-                remove_min_items_from_schema=True,
-                remove_defaults_from_schema=True,
-            )
+            # Try progressively fewer kwargs to handle version differences
+            for _kw in [
+                dict(
+                    model=model, api_key=api_key, base_url=CEREBRAS_BASE,
+                    temperature=0.0,
+                    # 4096 keeps us safely under llama3.1-8b's 8192-token context
+                    max_completion_tokens=4096,
+                    # Cerebras rejects response_format JSON schema API →
+                    # disable it; rely on system prompt instructions instead.
+                    dont_force_structured_output=True,
+                    # Injecting the full AgentOutput schema overflows 8k context.
+                    # We use extend_system_message in Agent kwargs to provide
+                    # targeted corrections for the most common schema mistakes.
+                    add_schema_to_system_prompt=False,
+                    remove_min_items_from_schema=True,
+                    remove_defaults_from_schema=True,
+                    max_retries=3,
+                ),
+                dict(
+                    model=model, api_key=api_key, base_url=CEREBRAS_BASE,
+                    temperature=0.0, max_completion_tokens=4096,
+                    dont_force_structured_output=True,
+                    add_schema_to_system_prompt=False,
+                    max_retries=3,
+                ),
+                dict(
+                    model=model, api_key=api_key, base_url=CEREBRAS_BASE,
+                    temperature=0.0, max_completion_tokens=4096,
+                ),
+            ]:
+                try:
+                    llm = BUChatOpenAI(**_kw)
+                    break
+                except TypeError as _te:
+                    print(f"[Cerebras] BUChatOpenAI kwarg fallback: {_te}", flush=True)
+                    continue
+            else:
+                raise RuntimeError("BUChatOpenAI constructor failed with all kwarg sets")
             print(f"[Cerebras] browser-use native ChatOpenAI ready: {model}", flush=True)
             return llm
         except Exception as e:
@@ -691,13 +709,41 @@ async def capture_screenshot(
         if page is None:
             return None
 
-        buf = await page.screenshot(type="jpeg", quality=50, full_page=False, timeout=15000)
+        # Playwright's Page.screenshot() uses 'type' but browser-use 0.12.x
+        # wraps it and uses 'screenshot_type' — try both to be version-agnostic.
+        _ss_kw_sets = [
+            dict(type="jpeg",          quality=40, full_page=False, timeout=15000),
+            dict(screenshot_type="jpeg", quality=40, full_page=False, timeout=15000),
+            dict(full_page=False, timeout=15000),  # PNG fallback (no type)
+        ]
+        buf = None
+        for _ss_kw in _ss_kw_sets:
+            try:
+                buf = await page.screenshot(**_ss_kw)
+                break
+            except TypeError:
+                continue
+            except Exception:
+                break
+        if buf is None:
+            return None
         b64 = base64.b64encode(buf).decode()
 
-        # Re-compress if too large (> 350 KB base64 ≈ ~262 KB binary)
-        if len(b64) > 350_000:
-            buf = await page.screenshot(type="jpeg", quality=25, full_page=False, timeout=15000)
-            b64 = base64.b64encode(buf).decode()
+        # Re-compress if too large (> 200 KB base64 — Supabase REST payload limit)
+        if len(b64) > 200_000:
+            for _ss_kw in [
+                dict(type="jpeg",          quality=15, full_page=False, timeout=15000),
+                dict(screenshot_type="jpeg", quality=15, full_page=False, timeout=15000),
+                dict(full_page=False, timeout=15000),
+            ]:
+                try:
+                    buf = await page.screenshot(**_ss_kw)
+                    b64 = base64.b64encode(buf).decode()
+                    break
+                except TypeError:
+                    continue
+                except Exception:
+                    break
 
         log_screenshot(task_id, b64, label, supabase)
         return b64
@@ -980,11 +1026,11 @@ async def run_browser_use_agent(
         # Build base kwargs
         agent_base_kwargs: dict = dict(task=prompt, llm=llm)
 
-        # max_failures / max_actions
+        # max_failures — give the model enough retries on schema errors
         for mf_name in ("max_failures", "max_actions"):
             if _agent_accepts(mf_name):
-                agent_base_kwargs[mf_name] = 5
-                print(f"[Agent] Failures kwarg: {mf_name}", flush=True)
+                agent_base_kwargs[mf_name] = 10
+                print(f"[Agent] Failures kwarg: {mf_name}=10", flush=True)
                 break
 
         # Limit DOM elements sent per step to stay within Cerebras context window.
@@ -1008,6 +1054,35 @@ async def run_browser_use_agent(
         for si_kwarg in ("sample_images",):
             if _agent_accepts(si_kwarg):
                 agent_base_kwargs[si_kwarg] = False
+                break
+
+        # ── extend_system_message: fix common LLM schema mistakes ─────────────
+        # llama3.1-8b frequently generates {"wait":{"timeout":N}} which fails
+        # Pydantic validation (45 errors) because WaitParams uses "seconds" not
+        # "timeout".  Without this correction the agent exhausts max_failures and
+        # returns 0 completed steps.
+        SCHEMA_CORRECTION = (
+            "\n\nCRITICAL — EXACT ACTION FIELD NAMES (use these precisely):\n"
+            '• Wait:     {"wait": {"seconds": N}}          ← "seconds", NOT "timeout"\n'
+            '• Navigate: {"navigate": {"url": "...", "new_tab": false}}\n'
+            '• Click:    {"click": {"index": N}}\n'
+            '• Input:    {"input": {"index": N, "text": "..."}}\n'
+            '• Scroll:   {"scroll": {"down": true, "pages": 1.0}}\n'
+            '• Done:     {"done": {"text": "..."}}\n'
+            '• Extract:  {"extract": {"goal": "..."}}\n'
+            "If you want to pause/wait, you MUST use 'seconds' as the field name.\n"
+            "NEVER use 'timeout', 'ms', 'delay', or any other field name for waiting."
+        )
+        for ext_kwarg in ("extend_system_message", "override_system_message"):
+            if _agent_accepts(ext_kwarg) and ext_kwarg == "extend_system_message":
+                agent_base_kwargs[ext_kwarg] = SCHEMA_CORRECTION
+                print(f"[Agent] Schema correction injected via {ext_kwarg}", flush=True)
+                break
+
+        # ── loop_detection: disable to avoid false early stops ────────────────
+        for ld_kwarg in ("loop_detection_enabled",):
+            if _agent_accepts(ld_kwarg):
+                agent_base_kwargs[ld_kwarg] = False
                 break
 
         # browser= vs browser_session=
@@ -1318,7 +1393,7 @@ if __name__ == "__main__":
 
     task_id = sys.argv[1].strip()
     print(f"\n{'=' * 60}", flush=True)
-    print(f"[AutoAgent Pro] browser-use worker v8", flush=True)
+    print(f"[AutoAgent Pro] browser-use worker v10 (schema-fix + llama3.1-8b)", flush=True)
     print(f"[AutoAgent Pro] Task ID: {task_id}", flush=True)
     print(f"{'=' * 60}\n", flush=True)
 
