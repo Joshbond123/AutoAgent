@@ -996,6 +996,20 @@ async def run_browser_use_agent(
                 print(f"[Agent] DOM cap kwarg: {elem_kwarg}=20", flush=True)
                 break
 
+        # Cerebras llama3.1-8b is text-only — it cannot process image_url content.
+        # Without use_vision=False, browser-use sends a base64 screenshot with every
+        # step, causing: "Content type 'image_url' is not supported by selected model."
+        for vis_kwarg in ("use_vision",):
+            if _agent_accepts(vis_kwarg):
+                agent_base_kwargs[vis_kwarg] = False
+                print(f"[Agent] Vision disabled: {vis_kwarg}=False (text-only model)", flush=True)
+                break
+        # Also disable sample_images if available (additional vision-related param)
+        for si_kwarg in ("sample_images",):
+            if _agent_accepts(si_kwarg):
+                agent_base_kwargs[si_kwarg] = False
+                break
+
         # browser= vs browser_session=
         # Prefer browser_session= for BrowserSession objects (new API 0.11+),
         # prefer browser= for old Browser objects.
