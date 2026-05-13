@@ -1,17 +1,17 @@
 #!/usr/bin/env python3
 """
-AutoAgent Pro — Browser-Use Worker v8
+AutoAgent Pro — Browser-Use Worker v9
 ==============================================
-Primary LLM  : Cerebras llama-3.3-70b via ChatCerebras (langchain-cerebras)
-               OR ChatOpenAI(base_url=CEREBRAS_BASE) fallback
+Primary LLM  : browser-use native ChatOpenAI → Cerebras endpoint (0.12.x)
+               Falls back to LangChain ChatCerebras / ChatOpenAI for 0.1.x
 Fallback LLM : Cloudflare Workers AI text model (custom BaseChatModel wrapper)
 Browser      : browser-use (Playwright, headless) — version-agnostic setup
 Screenshots  : Streamed to Supabase task_logs in real-time
 
 API compatibility matrix:
-  browser-use 0.1.x/0.2.x : Browser(config=BrowserConfig(...))  old API
-  browser-use 0.11+/0.12+  : BrowserSession(browser_profile=BrowserProfile(...))
-  Fallback                  : Agent without explicit browser (agent creates its own)
+  browser-use 0.12.x : browser-use own ChatOpenAI(base_url=CEREBRAS)  ← preferred
+  browser-use 0.1.x  : LangChain ChatCerebras / ChatOpenAI wrappers
+  Fallback            : Agent without explicit browser (agent creates its own)
 
 Integration references:
   https://inference-docs.cerebras.ai/integrations/browser-use
@@ -110,7 +110,19 @@ try:
 except ImportError as _e:
     print(f"[ERROR] browser-use not installed: {_e}", flush=True)
 
-# LangChain OpenAI — required for Cerebras OpenAI-compat integration
+# browser-use native ChatOpenAI (0.12.x) — OpenAI client wrapper browser-use ships itself.
+# Cerebras is OpenAI-compatible, so we can point it at CEREBRAS_BASE.
+# This is Strategy 0 and avoids ALL LangChain/Pydantic compatibility issues with 0.12.x.
+BU_NATIVE_CHAT_OK = False
+BUChatOpenAI      = None
+try:
+    from browser_use.llm.openai.chat import ChatOpenAI as BUChatOpenAI
+    BU_NATIVE_CHAT_OK = True
+    print("[OK] browser-use native ChatOpenAI imported", flush=True)
+except ImportError:
+    print("[INFO] browser-use native ChatOpenAI not available (pre-0.12 API)", flush=True)
+
+# LangChain OpenAI — required for Cerebras OpenAI-compat integration (0.1.x fallback)
 LANGCHAIN_OK = False
 ChatOpenAI   = None
 try:
@@ -120,7 +132,7 @@ try:
 except ImportError:
     print("[WARN] langchain-openai not installed", flush=True)
 
-# LangChain Cerebras native (optional — used if available)
+# LangChain Cerebras native (optional — 0.1.x fallback)
 CEREBRAS_LANGCHAIN_OK = False
 ChatCerebras          = None
 try:
@@ -315,14 +327,36 @@ def _make_wso_override():
 # ─────────────────────────────────────────────────────────────────────────────
 def make_cerebras_llm(api_key: str, model: str):
     """
-    Build a LangChain-compatible LLM for Cerebras with JSON-mode structured
-    output (required by browser-use).
+    Build an LLM for Cerebras compatible with the installed browser-use version.
 
     Strategy order:
-      1. langchain-cerebras ChatCerebras subclass (native — preferred)
-      2. langchain-openai ChatOpenAI subclass with Cerebras base_url
-         (official OpenAI-compat approach from Cerebras docs)
+      0. browser-use native ChatOpenAI → Cerebras base_url  (0.12.x preferred)
+         browser-use 0.12+ has its own LLM API (not LangChain). Its ChatOpenAI
+         dataclass accepts base_url, so we can point it at Cerebras's OpenAI-
+         compatible endpoint. This avoids all Pydantic/LangChain shim issues.
+      1. langchain-cerebras ChatCerebras subclass (0.1.x fallback)
+      2. langchain-openai ChatOpenAI subclass → Cerebras base_url (0.1.x fallback)
     """
+    # ── Strategy 0: browser-use native ChatOpenAI → Cerebras ──────────────────
+    if BU_NATIVE_CHAT_OK and BUChatOpenAI is not None:
+        try:
+            llm = BUChatOpenAI(
+                model=model,
+                api_key=api_key,
+                base_url=CEREBRAS_BASE,
+                temperature=0.0,
+                max_completion_tokens=8192,
+                # Compatibility flags: Cerebras supports JSON schema response_format,
+                # but setting these avoids schema compatibility issues if it doesn't.
+                remove_min_items_from_schema=True,
+                remove_defaults_from_schema=True,
+            )
+            print(f"[Cerebras] browser-use native ChatOpenAI ready: {model}", flush=True)
+            return llm
+        except Exception as e:
+            print(f"[Cerebras] BU native ChatOpenAI failed: {e} — trying LangChain", flush=True)
+
+    # ── Strategies 1 & 2 require LangChain core ──────────────────────────────
     if not LANGCHAIN_CORE_OK:
         print("[Cerebras] langchain-core not available", flush=True)
         return None
